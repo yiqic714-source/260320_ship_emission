@@ -17,7 +17,7 @@ OUT_DIR = '/home/chenyiqi/260320_ship_emission'
 YEAR_A = 2020
 YEAR_B = 2019
 # Percentage (0-100] of largest differences to highlight.
-TOP_PERCENT = 10
+TOP_PERCENT = 50
 OUT_POINTS_CSV = os.path.join(
 	OUT_DIR,
 	f'processed_data/sox_selected_points_{YEAR_B}_minus_{YEAR_A}_top{TOP_PERCENT:g}.csv'
@@ -27,7 +27,7 @@ OUT_POINTS_CSV = os.path.join(
 COLOR_SCALE_MODE = 'log'
 
 # Maximum number of highlighted top-10% grid cells to draw as dots.
-MAX_TOP10_DOTS = 600
+MAX_DOT_NUM = 1400
 
 # Shared color settings for all three subplots.
 SHARED_CMAP = 'viridis'
@@ -337,7 +337,7 @@ def plot_sox_difference(df, year_a, year_b, month, land_mask, coastal_exclusion_
 	top10_lons_plot, top10_lats_plot = _sparsify_points(
 		top10_lons,
 		top10_lats,
-		max_points=MAX_TOP10_DOTS,
+		max_points=MAX_DOT_NUM,
 	)
 
 	# Three maps share one fixed color scale and one colorbar.
@@ -483,17 +483,17 @@ def plot_sox_difference(df, year_a, year_b, month, land_mask, coastal_exclusion_
 			f'all diff sum is ~0, share is undefined.'
 		)
 
-	_plot_joint_pdf_combined(
-		all_a=sox_grid_a_ocean[ocean_valid],
-		all_b=sox_grid_b_ocean[ocean_valid],
-		top_a=sox_grid_a_ocean[top10_mask],
-		top_b=sox_grid_b_ocean[top10_mask],
-		out_path=out_fig_joint_pdf,
-		month=month,
-		year_a=year_a,
-		year_b=year_b,
-	)
-	print(f'Saved figure: {out_fig_joint_pdf}')
+	# _plot_joint_pdf_combined(
+	# 	all_a=sox_grid_a_ocean[ocean_valid],
+	# 	all_b=sox_grid_b_ocean[ocean_valid],
+	# 	top_a=sox_grid_a_ocean[top10_mask],
+	# 	top_b=sox_grid_b_ocean[top10_mask],
+	# 	out_path=out_fig_joint_pdf,
+	# 	month=month,
+	# 	year_a=year_a,
+	# 	year_b=year_b,
+	# )
+	# print(f'Saved figure: {out_fig_joint_pdf}')
 
 	selected_points = pd.DataFrame(
 		{
