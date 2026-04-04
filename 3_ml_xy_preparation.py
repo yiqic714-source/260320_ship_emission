@@ -7,13 +7,27 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from pyhdf.SD import SD, SDC
+from util import lon_to_utc_hour
 
 
 PROCESSED_DATA_DIR = Path('/home/chenyiqi/260320_ship_emission/processed_data')
 MOD08_DIR = Path('/data/MODIS/MxD08_D3')
-ERA5_ROOT = Path('/home/chenyiqi/260320_ship_emission/era5_daily_Aqua_time')
-TARGET_LOCAL_HOUR = 14
+ERA5_ROOT_BASE = Path('/home/chenyiqi/260320_ship_emission')
+SATELLITE_NAME = 'Aqua'  # 'Aqua' or 'Terra'
 SL_SUFFIXES = ('oper_instant', 'oper_accum', 'wave_instant')
+
+
+def _satellite_config(satellite_name: str) -> tuple[float, str, str, Path]:
+	name = satellite_name.strip().lower()
+	if name == 'aqua':
+		return 13.5, '1330', 'MYD08', ERA5_ROOT_BASE / 'era5_daily_Aqua_time'
+	if name == 'terra':
+		return 10.5, '1030', 'MOD08', ERA5_ROOT_BASE / 'era5_daily_Terra_time'
+	raise ValueError(f'Unsupported SATELLITE_NAME: {satellite_name}')
+
+
+TARGET_LST_HOUR, LST_TAG, MOD_PREFIX, ERA5_ROOT = _satellite_config(SATELLITE_NAME)
+TARGET_LOCAL_HOUR = TARGET_LST_HOUR
 
 MOD_VARS = {
 	'Cloud_Retrieval_Fraction_Liquid': 'cf_ret_liq_mod08',
@@ -53,22 +67,18 @@ def parse_target_date_from_argv(argv: list[str]) -> dt.date:
 
 def find_mod08_file_for_date(target_date: dt.date, mod08_dir: Path) -> Path:
 	yyyyddd = target_date.strftime('%Y%j')
-	pattern = str(mod08_dir / f'MYD08_D3.A{yyyyddd}.061.*.hdf')
+	pattern = str(mod08_dir / f'{MOD_PREFIX}_D3.A{yyyyddd}.061.*.hdf')
 	matches = sorted(glob.glob(pattern))
 	if not matches:
-		raise FileNotFoundError(f'No MYD08 file matched: {pattern}')
+		raise FileNotFoundError(f'No {MOD_PREFIX} file matched: {pattern}')
 	return Path(matches[0])
 
 
-def find_affected_csv(timestamp: str) -> Path:
-	candidates = [
-		PROCESSED_DATA_DIR / f'affected_latlon_{timestamp}.csv',
-		PROCESSED_DATA_DIR / f'hysplit_rsl/affected_latlon_{timestamp}.csv',
-	]
-	for candidate in candidates:
-		if candidate.exists():
-			return candidate
-	raise FileNotFoundError(f'Cannot find affected_latlon CSV for {timestamp} in processed_data paths.')
+def find_soxdiff_track_csv(target_date: dt.date) -> Path:
+	path = PROCESSED_DATA_DIR / f'hysplit_rsl/soxdiff_track_mean_{target_date:%Y%m%d}{LST_TAG}.csv'
+	if not path.exists():
+		raise FileNotFoundError(f'Cannot find soxdiff track CSV: {path}')
+	return path
 
 
 def load_mod08_data(mod_file: Path) -> dict:
@@ -87,40 +97,20 @@ def load_mod08_data(mod_file: Path) -> dict:
 	}
 
 
-def attach_mod_values(affected_df: pd.DataFrame, mod_data: dict) -> pd.DataFrame:
-	out_df = affected_df.copy()
+def attach_mod_values(point_df: pd.DataFrame, mod_data: dict, lat_col: str, lon_col: str) -> pd.DataFrame:
+	out_df = point_df.copy()
 	lat_grid = mod_data['lat']
 	lon_grid = mod_data['lon']
 
 	for out_name, data_2d in mod_data['vars'].items():
 		values = []
-		for lat_value, lon_value in zip(out_df['lat'].to_numpy(), out_df['lon'].to_numpy()):
+		for lat_value, lon_value in zip(out_df[lat_col].to_numpy(), out_df[lon_col].to_numpy()):
 			lat_idx = int(abs(lat_grid - lat_value).argmin())
 			lon_idx = int(abs(lon_grid - lon_value).argmin())
 			values.append(float(data_2d[lat_idx, lon_idx]))
 		out_df[out_name] = values
 
 	return out_df
-
-
-def aggregate_by_particle_start(mod_df: pd.DataFrame) -> pd.DataFrame:
-	required_cols = {'start_lat', 'start_lon'}
-	if not required_cols.issubset(set(mod_df.columns)):
-		raise ValueError('Input affected_latlon CSV must contain start_lat and start_lon columns.')
-
-	feature_cols = list(MOD_VARS.values())
-	result = (
-		mod_df.groupby(['start_lat', 'start_lon'], as_index=False)[feature_cols]
-		.mean(numeric_only=True)
-		.sort_values(['start_lat', 'start_lon'])
-		.reset_index(drop=True)
-	)
-	return result
-
-
-def lon_to_utc_hour(lon: float, local_hour: int = TARGET_LOCAL_HOUR) -> int:
-	zone_offset = int(np.floor((lon + 7.5) / 15.0))
-	return int((local_hour - zone_offset) % 24)
 
 
 def _to_dataset_lon_value(ds_lon: np.ndarray, point_lon: float) -> float:
@@ -148,9 +138,9 @@ def _build_era5_paths(target_date: dt.date, utc_hour: int) -> dict[str, Path]:
 	year = target_date.year
 	yyyymm = target_date.strftime('%Y%m')
 	hh = f'{utc_hour:02d}'
-	pl_path = ERA5_ROOT / f'{year}_LST1330_pl' / f'era5_pl_{yyyymm}_utc{hh}.nc'
+	pl_path = ERA5_ROOT / f'{year}_LST{LST_TAG}_pl' / f'era5_pl_{yyyymm}_utc{hh}.nc'
 	sl_paths = {
-		suffix: ERA5_ROOT / f'{year}_LST1330_sl' / f'era5_sl_{yyyymm}_utc{hh}_{suffix}.nc'
+		suffix: ERA5_ROOT / f'{year}_LST{LST_TAG}_sl' / f'era5_sl_{yyyymm}_utc{hh}_{suffix}.nc'
 		for suffix in SL_SUFFIXES
 	}
 	paths = {'pl': pl_path, **sl_paths}
@@ -186,24 +176,24 @@ def _extract_era5_from_dataset(
 	return features
 
 
-def extract_era5_for_start_points(mod_mean_df: pd.DataFrame, target_date: dt.date) -> pd.DataFrame:
-	if mod_mean_df.empty:
-		return mod_mean_df.copy()
+def extract_era5_for_t0_points(mod_df: pd.DataFrame, target_date: dt.date) -> pd.DataFrame:
+	if mod_df.empty:
+		return mod_df.copy()
+	required_cols = {'t0_lat', 't0_lon'}
+	if not required_cols.issubset(set(mod_df.columns)):
+		raise ValueError('Input CSV must contain t0_lat and t0_lon columns.')
 
 	ds_cache: dict[str, xr.Dataset] = {}
 	era_rows: list[dict[str, float]] = []
 
 	try:
-		for _, row in mod_mean_df.iterrows():
-			start_lat = float(row['start_lat'])
-			start_lon = float(row['start_lon'])
-			utc_hour = lon_to_utc_hour(start_lon)
+		for _, row in mod_df.iterrows():
+			start_lat = float(row['t0_lat'])
+			start_lon = float(row['t0_lon'])
+			utc_hour = lon_to_utc_hour(start_lon, target_lst_hour=TARGET_LST_HOUR)
 			paths = _build_era5_paths(target_date, utc_hour)
 
-			feature_row: dict[str, float] = {
-				'start_lat': start_lat,
-				'start_lon': start_lon,
-			}
+			feature_row: dict[str, float] = {}
 
 			for tag, path in paths.items():
 				path_key = str(path)
@@ -226,27 +216,27 @@ def extract_era5_for_start_points(mod_mean_df: pd.DataFrame, target_date: dt.dat
 			ds.close()
 
 	era_df = pd.DataFrame(era_rows)
-	return pd.merge(mod_mean_df, era_df, on=['start_lat', 'start_lon'], how='left')
+	return pd.concat([mod_df.reset_index(drop=True), era_df], axis=1)
 
 
 if __name__ == "__main__":
 	target_date = parse_target_date_from_argv(sys.argv)
-	timestamp = target_date.strftime('%y%m%d') + '14'
-	affected_csv = find_affected_csv(timestamp)
-	output_csv = PROCESSED_DATA_DIR / f'ml_xy_data/particle_mean_{timestamp}.csv'
+	input_csv = find_soxdiff_track_csv(target_date)
+	output_csv = PROCESSED_DATA_DIR / f'ml_xy_data/soxdiff_met_and_cld_{target_date:%Y%m%d}.csv'
 
 	mod_file = find_mod08_file_for_date(target_date, MOD08_DIR)
-	affected_df = pd.read_csv(affected_csv)
+	affected_df = pd.read_csv(input_csv)
 	mod_data = load_mod08_data(mod_file)
-	row_with_vars = attach_mod_values(affected_df, mod_data)
-	mod_mean_df = aggregate_by_particle_start(row_with_vars)
-	result_df = extract_era5_for_start_points(mod_mean_df, target_date)
+	row_with_vars = attach_mod_values(affected_df, mod_data, lat_col='t0_lat', lon_col='t0_lon')
+	result_df = extract_era5_for_t0_points(row_with_vars, target_date)
 
 	output_csv.parent.mkdir(parents=True, exist_ok=True)
 	result_df.to_csv(output_csv, index=False)
 
+	print(f'SATELLITE_NAME: {SATELLITE_NAME}')
+	print(f'TARGET_LST_HOUR: {TARGET_LST_HOUR}')
 	print(f'MOD file: {mod_file}')
-	print(f'Affected CSV: {affected_csv}')
+	print(f'Input CSV: {input_csv}')
 	print(f'Input rows: {len(affected_df)}')
 	print(f'Output rows: {len(result_df)}')
 	print(f'Saved CSV: {output_csv}')
