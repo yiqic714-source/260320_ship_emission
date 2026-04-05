@@ -1,5 +1,6 @@
 import datetime as dt
 import math
+import numpy as np
 
 
 def round_to_nearest_utc_hour(time_value: dt.datetime) -> dt.datetime:
@@ -30,3 +31,20 @@ def lon_to_utc_hour(lon: float, target_lst_hour: float) -> int:
 		target_lst_hour=target_lst_hour,
 	)
 	return int(utc_dt.hour)
+
+
+def read_and_mask_mod_variable(hdf, var_name: str) -> np.ndarray:
+	"""Read HDF SDS and apply fill/offset/scale corrections."""
+	sds = hdf.select(var_name)
+	data = sds[:].astype(float)
+	attrs = sds.attributes()
+	fill_value = attrs.get('_FillValue', None)
+	scale_factor = attrs.get('scale_factor')
+	offset = attrs.get('add_offset')
+	if fill_value is not None:
+		data[data == fill_value] = float('nan')
+	if offset is not None:
+		data = data - offset
+	if scale_factor is not None:
+		data = data * scale_factor
+	return data

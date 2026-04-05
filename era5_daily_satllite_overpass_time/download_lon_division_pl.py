@@ -32,8 +32,8 @@ for utc_hour in range(24):
     
     print(f"UTC {utc_hour:02d}:00 → 对应经度范围：{lon_min:.1f}° ~ {lon_max:.1f}°") 
 
-    for month in range(1, 13):
-        output_filename = f"2019_LST1330_pl/era5_pl_2019{month:02d}_utc{utc_hour:02d}.nc"
+    for month in range(1, 2):
+        output_filename = f"2021_LST1330_pl/era5_pl_2021{month:02d}_utc{utc_hour:02d}.nc"
 
         request = {
             "product_type": ["reanalysis"],
@@ -53,7 +53,7 @@ for utc_hour in range(24):
                 "500", "650", "750",
                 "850", "925", "1000"
             ],
-            "year": ["2019"],
+            "year": ["2021"],
             "month": month,
             "day": [
                 "01", "02", "03",

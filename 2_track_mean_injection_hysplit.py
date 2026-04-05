@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import calendar
 from collections import defaultdict
 import math
 import subprocess
@@ -102,6 +103,66 @@ def meteo_week_index_from_date(date_value: dt.date) -> int:
 def build_meteo_path(year: int, month: int, week_index: int) -> str:
 	month_abbr = MONTH_ABBR[month]
 	return f'{year}/gdas1.{month_abbr}{year % 100:02d}.w{week_index}'
+
+
+def max_week_index_in_month(year: int, month: int) -> int:
+	# w5 exists if the month has day 29 or later.
+	return 5 if calendar.monthrange(year, month)[1] >= 29 else 4
+
+
+def previous_month(year: int, month: int) -> tuple[int, int]:
+	if month == 1:
+		return year - 1, 12
+	return year, month - 1
+
+
+def next_month(year: int, month: int) -> tuple[int, int]:
+	if month == 12:
+		return year + 1, 1
+	return year, month + 1
+
+
+def previous_week(year: int, month: int, week_index: int) -> tuple[int, int, int]:
+	if week_index > 1:
+		return year, month, week_index - 1
+	prev_year, prev_month_value = previous_month(year, month)
+	return prev_year, prev_month_value, max_week_index_in_month(prev_year, prev_month_value)
+
+
+def next_week(year: int, month: int, week_index: int) -> tuple[int, int, int]:
+	max_week = max_week_index_in_month(year, month)
+	if week_index < max_week:
+		return year, month, week_index + 1
+	next_year, next_month_value = next_month(year, month)
+	return next_year, next_month_value, 1
+
+
+def find_three_context_meteo_paths(date_value: dt.date) -> list[str]:
+	base_dir = Path(METEO_BASE_DIR)
+	cur_year = date_value.year
+	cur_month = date_value.month
+	cur_week = meteo_week_index_from_date(date_value)
+
+	prev_year, prev_month_value, prev_week = previous_week(cur_year, cur_month, cur_week)
+	next_year, next_month_value, next_week_index = next_week(cur_year, cur_month, cur_week)
+
+	week_triplet = [
+		(prev_year, prev_month_value, prev_week),
+		(cur_year, cur_month, cur_week),
+		(next_year, next_month_value, next_week_index),
+	]
+
+	paths: list[str] = []
+	for year, month, week_index in week_triplet:
+		rel_path = build_meteo_path(year, month, week_index)
+		if not (base_dir / rel_path).exists():
+			raise FileNotFoundError(
+				f'Meteorology file not found for {year}-{month:02d} w{week_index}: '
+				f'{base_dir / rel_path}'
+			)
+		paths.append(rel_path)
+
+	return paths
 
 
 def load_month_points_from_npz(
@@ -243,7 +304,7 @@ def build_step_weights(step_count: int, mode: str) -> np.ndarray:
 	else:
 		weights = avg_weights[:step_count]
 
-	print(f'Weights (step 0..{step_count - 1}): {weights.tolist()}')
+	# print(f'Weights (step 0..{step_count - 1}): {weights.tolist()}')
 	_WEIGHT_CACHE[cache_key] = weights
 	return weights
 
@@ -272,7 +333,7 @@ def parse_target_date_from_argv(argv: list[str]) -> dt.date:
 def update_control(
 	control_path: Path,
 	points: list[tuple[float, float]],
-	meteo_path: str,
+	meteo_paths: list[str],
 	output_name: str,
 	target_dt: dt.datetime,
 	run_hours: int,
@@ -335,14 +396,20 @@ def update_control(
 	updated_lines[new_run_hours_idx] = str(run_hours)
 
 	footer_offset = new_run_hours_idx
-	nmet = int(updated_lines[footer_offset + 3].strip())
-	first_meteo_dir_idx = footer_offset + 4
-	first_meteo_file_idx = footer_offset + 5
-	out_name_idx = footer_offset + 4 + 2 * nmet + 1
+	nmet_old = int(updated_lines[footer_offset + 3].strip())
+	meteo_start = footer_offset + 4
+	meteo_end = meteo_start + 2 * nmet_old
+	rest_after_meteo = updated_lines[meteo_end:]
 
-	updated_lines[first_meteo_dir_idx] = METEO_BASE_DIR
-	updated_lines[first_meteo_file_idx] = meteo_path
-	updated_lines[out_name_idx] = output_name
+	meteo_lines: list[str] = []
+	for meteo_path in meteo_paths:
+		meteo_lines.extend([METEO_BASE_DIR, meteo_path])
+
+	updated_lines[footer_offset + 3] = str(len(meteo_paths))
+	updated_lines = updated_lines[:meteo_start] + meteo_lines + rest_after_meteo
+
+	output_name_idx = meteo_start + len(meteo_lines) + 1
+	updated_lines[output_name_idx] = output_name
 	control_path.write_text('\n'.join(updated_lines) + '\n')
 
 
@@ -430,6 +497,7 @@ def plot_kept_t0_positions(
 	ax.set_title('Global Distribution of Kept Particles at T0 UTC')
 	output_png.parent.mkdir(parents=True, exist_ok=True)
 	fig.savefig(output_png, bbox_inches='tight')
+	print(f'Saved figure: {output_png}')
 	plt.close(fig)
 
 
@@ -449,12 +517,10 @@ def main() -> None:
 	result_csv_path = RESULT_CSV_DIR / f'soxdiff_track_mean_{target_date:%Y%m%d}{LST_TAG}.csv'
 	kept_t0_png = RESULT_CSV_DIR / f'kept_particles_t0_map_{target_date:%Y%m%d}.png'
 
-	print(f'SATELLITE_NAME: {SATELLITE_NAME}')
-	print(f'TARGET_LST_HOUR: {TARGET_LST_HOUR}')
+	# print(f'TARGET_LST_HOUR: {TARGET_LST_HOUR}')
 	print(f'Finite SOx-diff particles in NPZ (month={target_date.month}): {len(run_points_all)}')
 	print(f'Selected particle range (1-based, inclusive): {selected_start}..{selected_end}')
-	print(f'Selected particles to run: {len(run_points)}')
-	print(f'Using run_hours={RUN_HOURS}')
+	# print(f'Using run_hours={RUN_HOURS}')
 
 	saved_rows: list[dict[str, float | int | str]] = []
 	kept_t0_records: list[tuple[dt.datetime, float, float]] = []
@@ -467,11 +533,10 @@ def main() -> None:
 		if not hour_points:
 			continue
 
-		week_index = meteo_week_index_from_date(utc_dt.date())
-		meteo_path = build_meteo_path(utc_dt.year, utc_dt.month, week_index)
-		output_name = f'output_{utc_dt:%Y%m%d}_{utc_dt.hour:02d}'
+		meteo_paths = find_three_context_meteo_paths(utc_dt.date())
+		output_name = 'output'
 
-		update_control(CONTROL_PATH, hour_points, meteo_path, output_name, utc_dt, RUN_HOURS)
+		update_control(CONTROL_PATH, hour_points, meteo_paths, output_name, utc_dt, RUN_HOURS)
 		print(f'T0 datetime (UTC): {utc_dt:%Y-%m-%d %H:%M}, particles={len(hour_points)}')
 
 		run_hyts(RUN_DIR, HYSPLIT_EXEC)
@@ -488,6 +553,8 @@ def main() -> None:
 				for lat, lon in track
 			]
 			weighted_sox_diff = compute_weighted_mean(step_sox_diff, WEIGHT_MODE)
+			if not math.isfinite(weighted_sox_diff):
+				continue
 			t0_lat, t0_lon = track[0]
 			kept_particles += 1
 			kept_t0_records.append((utc_dt, float(t0_lat), float(t0_lon)))
@@ -504,8 +571,6 @@ def main() -> None:
 	# plot_kept_t0_positions(kept_t0_records, kept_t0_png)
 
 	print(f'Saved CSV: {result_csv_path}')
-	print(f'Saved figure: {kept_t0_png}')
-	print(f'UTC-hour runs executed: {runs_executed}')
 	print(f'Kept particles: {kept_particles}/{total_particles_simulated}')
 
 

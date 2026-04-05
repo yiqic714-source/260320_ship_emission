@@ -7,12 +7,12 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from pyhdf.SD import SD, SDC
-from util import lon_to_utc_hour
+from util import lon_to_utc_hour, read_and_mask_mod_variable
 
 
 PROCESSED_DATA_DIR = Path('/home/chenyiqi/260320_ship_emission/processed_data')
 MOD08_DIR = Path('/data/MODIS/MxD08_D3')
-ERA5_ROOT_BASE = Path('/home/chenyiqi/260320_ship_emission')
+ERA5_ROOT = Path('/home/chenyiqi/260320_ship_emission/era5_daily_satllite_overpass_time')
 SATELLITE_NAME = 'Aqua'  # 'Aqua' or 'Terra'
 SL_SUFFIXES = ('oper_instant', 'oper_accum', 'wave_instant')
 
@@ -20,41 +20,25 @@ SL_SUFFIXES = ('oper_instant', 'oper_accum', 'wave_instant')
 def _satellite_config(satellite_name: str) -> tuple[float, str, str, Path]:
 	name = satellite_name.strip().lower()
 	if name == 'aqua':
-		return 13.5, '1330', 'MYD08', ERA5_ROOT_BASE / 'era5_daily_Aqua_time'
+		return 13.5, '1330', 'MYD08'
 	if name == 'terra':
-		return 10.5, '1030', 'MOD08', ERA5_ROOT_BASE / 'era5_daily_Terra_time'
+		return 10.5, '1030', 'MOD08'
 	raise ValueError(f'Unsupported SATELLITE_NAME: {satellite_name}')
 
 
-TARGET_LST_HOUR, LST_TAG, MOD_PREFIX, ERA5_ROOT = _satellite_config(SATELLITE_NAME)
+TARGET_LST_HOUR, LST_TAG, MOD_PREFIX = _satellite_config(SATELLITE_NAME)
 TARGET_LOCAL_HOUR = TARGET_LST_HOUR
 
 MOD_VARS = {
 	'Cloud_Retrieval_Fraction_Liquid': 'cf_ret_liq_mod08',
 	'Cloud_Optical_Thickness_Liquid_Mean': 'cot_mod08',
+	'Cloud_Water_Path_Liquid_Mean': 'cwp_mod08',
 	'Cloud_Effective_Radius_Liquid_Mean': 'cer_mod08',
-	'Solar_Zenith_Mean': 'sza_mod08',
 	'Cloud_Retrieval_Fraction_Combined': 'cf_ret_combined_mod08',
+	'Aerosol_Optical_Depth_Land_Ocean_Mean': 'aod_mod08',
+	'Solar_Zenith_Mean': 'sza_mod08',
 	'Solar_Azimuth_Mean': 'saa_mod08',
 }
-
-
-def read_and_mask_mod_variable(hdf, var_name):
-	"""Read HDF variable and apply fill/offset/scale in the same style as reference code."""
-	sds = hdf.select(var_name)
-	data = sds[:].astype(float)
-	attrs = sds.attributes()
-	fill_value = attrs.get('_FillValue', None)
-	scale_factor = attrs.get('scale_factor')
-	offset = attrs.get('add_offset')
-	if fill_value is not None:
-		data[data == fill_value] = float('nan')
-	if offset is not None:
-		data = data - offset
-	if scale_factor is not None:
-		data = data * scale_factor
-	return data
-
 
 def parse_target_date_from_argv(argv: list[str]) -> dt.date:
 	if len(argv) != 4:
@@ -75,7 +59,7 @@ def find_mod08_file_for_date(target_date: dt.date, mod08_dir: Path) -> Path:
 
 
 def find_soxdiff_track_csv(target_date: dt.date) -> Path:
-	path = PROCESSED_DATA_DIR / f'hysplit_rsl/soxdiff_track_mean_{target_date:%Y%m%d}{LST_TAG}.csv'
+	path = PROCESSED_DATA_DIR / f'hysplit_rsl/{target_date:%Y}/soxdiff_track_mean_{target_date:%Y%m%d}{LST_TAG}.csv'
 	if not path.exists():
 		raise FileNotFoundError(f'Cannot find soxdiff track CSV: {path}')
 	return path
@@ -222,7 +206,7 @@ def extract_era5_for_t0_points(mod_df: pd.DataFrame, target_date: dt.date) -> pd
 if __name__ == "__main__":
 	target_date = parse_target_date_from_argv(sys.argv)
 	input_csv = find_soxdiff_track_csv(target_date)
-	output_csv = PROCESSED_DATA_DIR / f'ml_xy_data/soxdiff_met_and_cld_{target_date:%Y%m%d}.csv'
+	output_csv = PROCESSED_DATA_DIR / f'ml_xy_data/soxdiff_met_and_cld_{target_date:%Y%m%d}{LST_TAG}.csv'
 
 	mod_file = find_mod08_file_for_date(target_date, MOD08_DIR)
 	affected_df = pd.read_csv(input_csv)
