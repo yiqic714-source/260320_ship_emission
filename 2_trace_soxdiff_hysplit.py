@@ -15,6 +15,7 @@ import cartopy.io.shapereader as shpreader
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import numpy as np
+import pandas as pd
 from shapely.geometry import Point
 from shapely.ops import unary_union
 from shapely.prepared import prep
@@ -48,7 +49,6 @@ RESULT_CSV_DIR = Path('/home/chenyiqi/260320_ship_emission/processed_data/hyspli
 METEO_BASE_DIR = '/home/chenyiqi/hysplit/noaa_arl_gdas1deg/'
 WEIGHT_SOURCE_CSV = Path('/home/chenyiqi/260320_ship_emission/M22_Fig2_source_data.csv')
 WEIGHT_SOURCE_LINES = [35, 43, 51, 59]
-_WEIGHT_CACHE: dict[tuple[int, str], np.ndarray] = {}
 
 MONTH_ABBR = {
 	1: 'jan',
@@ -249,62 +249,6 @@ def lookup_sox_diff(
 	return float(diff_grid[lat_idx, lon_idx])
 
 
-def build_step_weights(step_count: int, mode: str) -> np.ndarray:
-	if step_count <= 0:
-		raise ValueError('step_count must be positive.')
-	if mode != 'uniform':
-		raise ValueError(f'Unsupported WEIGHT_MODE: {mode}')
-	cache_key = (step_count, mode)
-	if cache_key in _WEIGHT_CACHE:
-		return _WEIGHT_CACHE[cache_key]
-
-	all_lines = WEIGHT_SOURCE_CSV.read_text(encoding='utf-8').splitlines()
-	line_arrays: list[np.ndarray] = []
-	for line_no in WEIGHT_SOURCE_LINES:
-		if line_no < 1 or line_no > len(all_lines):
-			continue
-		raw_line = all_lines[line_no - 1].strip()
-		if not raw_line:
-			continue
-		parts = list(csv.reader([raw_line]))[0]
-		if not parts or 'anomaly' not in parts[0].strip().lower():
-			continue
-		vals: list[float] = []
-		for token in parts[1:]:
-			t = token.strip()
-			if t == '':
-				continue
-			try:
-				vals.append(float(t) * 100 - 100)
-			except ValueError:
-				continue
-		if vals:
-			line_arrays.append(np.asarray(vals, dtype=float))
-
-	if not line_arrays:
-		raise ValueError(
-			f'No valid weight rows found in {WEIGHT_SOURCE_CSV} for lines {WEIGHT_SOURCE_LINES}. '
-			'Please verify line numbers.'
-		)
-
-	use_len = min(step_count, min(arr.size for arr in line_arrays))
-	if use_len <= 0:
-		raise ValueError('Weight rows are empty after parsing.')
-
-	normalized_rows: list[np.ndarray] = []
-	for arr in line_arrays:
-		arr_cut = arr[:use_len]
-		total = float(np.sum(arr_cut))
-		if np.isfinite(total) and abs(total) > 1e-12:
-			normalized_rows.append(arr_cut / total)
-		else:
-			normalized_rows.append(np.full(use_len, 1.0 / use_len, dtype=float))
-
-	weights = np.mean(np.vstack(normalized_rows), axis=0)
-	_WEIGHT_CACHE[cache_key] = weights
-	return weights
-
-
 def build_step_weights_and_std(step_count: int, mode: str) -> tuple[np.ndarray, np.ndarray]:
 	if step_count <= 0:
 		raise ValueError('step_count must be positive.')
@@ -357,10 +301,26 @@ def build_step_weights_and_std(step_count: int, mode: str) -> tuple[np.ndarray, 
 	return np.mean(stacked, axis=0), np.std(stacked, axis=0)
 
 
-def compute_weighted_mean(values: list[float], mode: str) -> float:
+def read_step_weights_csv(input_csv: Path) -> np.ndarray:
+	if not input_csv.exists():
+		raise FileNotFoundError(f'Cannot find step weights CSV: {input_csv}')
+	df = pd.read_csv(input_csv)
+	if 'step_weight_ave' not in df.columns:
+		raise ValueError(f'step_weight_ave column missing in {input_csv}')
+	weights = pd.to_numeric(df['step_weight_ave'], errors='coerce').to_numpy(dtype=float)
+	weights = weights[np.isfinite(weights)]
+	if weights.size == 0:
+		raise ValueError(f'No finite step_weight_ave values in {input_csv}')
+	return weights
+
+
+def compute_weighted_mean(values: list[float], weights: np.ndarray) -> float:
 	arr = np.asarray(values, dtype=float)
-	weights = build_step_weights(arr.size, mode)
-	arr = arr[:weights.size]
+	use_len = min(arr.size, int(weights.size))
+	if use_len <= 0:
+		return float('nan')
+	arr = arr[:use_len]
+	weights = weights[:use_len]
 	if not np.all(np.isfinite(arr)):
 		return float('nan')
 	return float(np.average(arr, weights=weights))
@@ -593,9 +553,11 @@ def main() -> None:
 	kept_particles = 0
 	runs_executed = 0
 	step_weights_saved = False
+	step_weights_ave: np.ndarray | None = None
 	step_weights_file_exists = step_weights_csv_path.exists()
 	if step_weights_file_exists:
 		step_weights_saved = True
+		step_weights_ave = read_step_weights_csv(step_weights_csv_path)
 
 	for utc_dt in utc_slots:
 		hour_points = points_by_utc.get(utc_dt, [])
@@ -622,11 +584,13 @@ def main() -> None:
 				for lat, lon in track
 			]
 			if not step_weights_saved:
-				step_weights, step_stds = build_step_weights_and_std(len(step_sox_diff), WEIGHT_MODE)
-				write_step_weights_csv(step_weights, step_stds, step_weights_csv_path)
+				step_weights_ave, step_stds = build_step_weights_and_std(len(step_sox_diff), WEIGHT_MODE)
+				write_step_weights_csv(step_weights_ave, step_stds, step_weights_csv_path)
 				print(f'Saved step weights: {step_weights_csv_path}')
 				step_weights_saved = True
-			weighted_sox_diff = compute_weighted_mean(step_sox_diff, WEIGHT_MODE)
+			if step_weights_ave is None:
+				raise ValueError('step_weights_ave is not initialized.')
+			weighted_sox_diff = compute_weighted_mean(step_sox_diff, step_weights_ave)
 			if not math.isfinite(weighted_sox_diff):
 				continue
 			t0_lat, t0_lon = track[0]

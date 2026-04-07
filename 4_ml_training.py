@@ -106,7 +106,7 @@ def main() -> None:
 	df = pd.read_csv(DATA_CSV)
 	df = _add_pressure_diff_features(df)
 	df['nd'] = _build_nd(df)
-	print(np.mean(df['nd']))
+	# print(np.mean(df['nd']))
 
 	feature_cols = _select_feature_columns(df)
 	targets = ['cf_ret_liq_mod08', 'nd', 'cwp_mod08']
