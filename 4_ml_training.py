@@ -11,7 +11,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
 
-DATA_CSV = Path('/home/chenyiqi/260320_ship_emission/processed_data/ml_xy_data/soxdiff_met_and_cld_202001021330.csv')
+DATA_CSV = Path('/home/chenyiqi/260320_ship_emission/processed_data/ml_xy_data/2020/soxdiff_met_and_cld_202001021330.csv')
 GAMM = 1.37e-5
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
