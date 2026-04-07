@@ -17,10 +17,17 @@ from sklearn.pipeline import Pipeline
 DATA_ROOT = Path('/home/chenyiqi/260320_ship_emission/processed_data/ml_xy_data')
 GAMM = 1.37e-5
 RANDOM_STATE = 42
-TOP_FRAC = 0.10
 VAL_FRAC_2020 = 0.10
 YEARS = (2019, 2020)
-JJA_MONTHS = {6, 7, 8}
+SEASON = 'JJA'  # One of: DJF, MAM, JJA, SON
+SEASON_MONTHS = {
+	'DJF': {12, 1, 2},
+	'MAM': {3, 4, 5},
+	'JJA': {6, 7, 8},
+	'SON': {9, 10, 11},
+}
+# Keep rows with SOX_COL quantile in [q_low, q_high], e.g. (0.0, 0.1) or (0.9, 1.0).
+QUANTILE_RANGE = (0.9, 1.0)
 SOX_COL = 'weighted_sox_diff'
 PLOT_DIR = Path('/home/chenyiqi/260320_ship_emission/processed_data/ml_xy_data/training_figs')
 
@@ -28,25 +35,6 @@ PLOT_DIR = Path('/home/chenyiqi/260320_ship_emission/processed_data/ml_xy_data/t
 def _build_nd(df: pd.DataFrame) -> pd.Series:
 	return GAMM * np.power(df['cot_mod08'], 0.5) * np.power(df['cer_mod08'] * 1e-6, -2.5) * 1e-6
 
-
-def _convert_pressure_diff_features(df: pd.DataFrame) -> pd.DataFrame:
-	out = df.copy()
-	bases = ['u', 'v', 'w', 'vo', 'r', 'q', 'z', 'pv', 'd', 't']
-	pressure_levels = [1000, 925, 850, 750, 650, 500]
-	for base in bases:
-		c1000 = f'{base}_1000'
-		c750 = f'{base}_750'
-		c500 = f'{base}_500'
-		if c1000 in out.columns and c750 in out.columns:
-			out[f'{base}_1000_minus_750'] = out[c1000] - out[c750]
-		if c750 in out.columns and c500 in out.columns:
-			out[f'{base}_750_minus_500'] = out[c750] - out[c500]
-
-	# Remove original pressure-level columns after creating difference features.
-	drop_cols = [f'{base}_{p}' for base in bases for p in pressure_levels if f'{base}_{p}' in out.columns]
-	if drop_cols:
-		out = out.drop(columns=drop_cols)
-	return out
 
 
 def _extract_date_from_name(path: Path) -> dt.date | None:
@@ -57,21 +45,26 @@ def _extract_date_from_name(path: Path) -> dt.date | None:
 	return dt.datetime.strptime(m.group(1), '%Y%m%d').date()
 
 
-def _load_jja_data(data_root: Path) -> pd.DataFrame:
+def _load_season_data(data_root: Path, season: str) -> pd.DataFrame:
+	season_key = season.strip().upper()
+	if season_key not in SEASON_MONTHS:
+		raise ValueError(f'Unsupported SEASON: {season}. Use one of {list(SEASON_MONTHS.keys())}.')
+	months = SEASON_MONTHS[season_key]
+
 	paths = sorted(data_root.glob('*/soxdiff_met_and_cld_*.csv'))
 	frames: list[pd.DataFrame] = []
 	for path in paths:
 		date_value = _extract_date_from_name(path)
 		if date_value is None:
 			continue
-		if date_value.year not in YEARS or date_value.month not in JJA_MONTHS:
+		if date_value.year not in YEARS or date_value.month not in months:
 			continue
 		df = pd.read_csv(path)
 		df['source_year'] = date_value.year
 		frames.append(df)
 
 	if not frames:
-		raise ValueError('No JJA CSV files found for 2019/2020.')
+		raise ValueError(f'No {season_key} CSV files found for 2019/2020.')
 
 	return pd.concat(frames, ignore_index=True)
 
@@ -207,26 +200,51 @@ def _plot_test_global_distribution(test_plot_df: pd.DataFrame, target_col: str, 
 	plt.close(fig)
 	return out_path
 
+def _convert_pressure_diff_features(df: pd.DataFrame) -> pd.DataFrame:
+	out = df.copy()
+	bases = ['u', 'v', 'w', 'vo', 'r', 'q', 'z', 'pv', 'd', 't']
+	pressure_levels = [1000, 925, 850, 750, 650, 500]
+	ref_level = pressure_levels[-1]
+	for base in bases:
+		c_ref = f'{base}_{ref_level}'
+		for p in pressure_levels[:-1]:
+			c_p = f'{base}_{p}'
+			if c_p in out.columns and c_ref in out.columns:
+				out[f'{base}_{p}_minus_{ref_level}'] = out[c_p] - out[c_ref]
+
+	# Remove original pressure-level columns after creating difference features.
+	drop_cols = [f'{base}_{p}' for base in bases for p in pressure_levels[1:]]
+	if drop_cols:
+		out = out.drop(columns=drop_cols)
+	return out
 
 def main() -> None:
-	df = _load_jja_data(DATA_ROOT)
+	df = _load_season_data(DATA_ROOT, SEASON)
 	if SOX_COL not in df.columns:
 		raise ValueError(f'Missing soxdiff column: {SOX_COL}')
 	df = df[np.isfinite(df[SOX_COL].to_numpy(dtype=float))].copy()
 	if df.empty:
 		raise ValueError('No finite rows in soxdiff column.')
 
-	threshold = float(df[SOX_COL].quantile(1.0 - TOP_FRAC))
-	df_top = df[df[SOX_COL] >= threshold].copy()
+	q_low, q_high = QUANTILE_RANGE
+	low_thr = float(df[SOX_COL].quantile(q_low))
+	high_thr = float(df[SOX_COL].quantile(q_high))
+	df_top = df[(df[SOX_COL] >= low_thr) & (df[SOX_COL] <= high_thr)].copy()
+
 	if df_top.empty:
-		raise ValueError('No rows selected in top soxdiff fraction.')
+		raise ValueError('No rows selected in configured quantile range.')
 
 	df_2019 = df_top[df_top['source_year'] == 2019].copy()
 	df_2020 = df_top[df_top['source_year'] == 2020].copy()
 	# df_2019 = _convert_pressure_diff_features(df_2019)
-	df_2019['nd'] = _build_nd(df_2019)
 	# df_2020 = _convert_pressure_diff_features(df_2020)
+	df_2019['nd'] = _build_nd(df_2019)
 	df_2020['nd'] = _build_nd(df_2020)
+	df_2019['nd'] = np.log(df_2019['nd'].to_numpy(dtype=float) + 1e-9)
+	df_2020['nd'] = np.log(df_2020['nd'].to_numpy(dtype=float) + 1e-9)
+	df_2019['cwp_mod08'] = np.log(df_2019['cwp_mod08'].to_numpy(dtype=float) + 1e-9)
+	df_2020['cwp_mod08'] = np.log(df_2020['cwp_mod08'].to_numpy(dtype=float) + 1e-9)
+
 	if df_2019.empty or df_2020.empty:
 		raise ValueError('Top soxdiff rows do not contain both 2019 and 2020 data.')
 
@@ -247,8 +265,8 @@ def main() -> None:
 		if target not in train_df.columns:
 			raise ValueError(f'Missing target column in data: {target}')
 
-	print(f'Selected period: 2019/2020 JJA')
-	print(f'Rows -> loaded finite soxdiff: {len(df)}, top{TOP_FRAC:.0%}: {len(df_top)}')
+	print(f'Selected period: 2019/2020 {SEASON.upper()}')
+	print(f'Rows -> loaded finite soxdiff: {len(df)}, quantile[{q_low:.2f}, {q_high:.2f}]: {len(df_top)}')
 	print(f'Rows -> train(2020): {len(train_df)}, val(2020): {len(val_df)}, test(2019): {len(test_df)}')
 	print(f'Feature count: {len(feature_cols)}')
 	print('Features: ' + ', '.join(feature_cols))
@@ -263,7 +281,7 @@ def main() -> None:
 		results.append(metrics)
 	result_df = pd.DataFrame(results)
 
-	print(f'Top fraction: {TOP_FRAC:.0%}, threshold={threshold:.6g}')
+	print(f'Quantile range: [{q_low:.2f}, {q_high:.2f}], thresholds=[{low_thr:.6g}, {high_thr:.6g}]')
 	print(result_df.to_string(index=False))
 
 
