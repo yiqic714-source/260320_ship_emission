@@ -19,7 +19,7 @@ GAMM = 1.37e-5
 RANDOM_STATE = 42
 VAL_FRAC_2020 = 0.10
 YEARS = (2019, 2020)
-SEASON = 'JJA'  # One of: DJF, MAM, JJA, SON
+SEASON = 'DJF'  # One of: DJF, MAM, JJA, SON
 SEASON_MONTHS = {
 	'DJF': {12, 1, 2},
 	'MAM': {3, 4, 5},
@@ -27,7 +27,7 @@ SEASON_MONTHS = {
 	'SON': {9, 10, 11},
 }
 # Keep rows with SOX_COL quantile in [q_low, q_high], e.g. (0.0, 0.1) or (0.9, 1.0).
-QUANTILE_RANGE = (0.9, 1.0)
+QUANTILE_RANGE = (0.9, 1.0)#(0, 0.1)
 SOX_COL = 'weighted_sox_diff'
 PLOT_DIR = Path('/home/chenyiqi/260320_ship_emission/processed_data/ml_xy_data/training_figs')
 
@@ -160,9 +160,18 @@ def _train_one_target(
 	return metrics, test_plot_df
 
 
-def _plot_test_global_distribution(test_plot_df: pd.DataFrame, target_col: str, out_dir: Path) -> Path:
+def _plot_test_global_distribution(
+	test_plot_df: pd.DataFrame,
+	target_col: str,
+	out_dir: Path,
+	season: str,
+	q_low: float,
+	q_high: float,
+) -> Path:
 	out_dir.mkdir(parents=True, exist_ok=True)
-	out_path = out_dir / f'test_global_{target_col}.png'
+	q_low_pct = int(round(q_low * 100))
+	q_high_pct = int(round(q_high * 100))
+	out_path = out_dir / f'test_global_{target_col}_{season.upper()}_q{q_low_pct:02d}-{q_high_pct:02d}.png'
 
 	fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=220, constrained_layout=True)
 	plot_pairs = [
@@ -276,7 +285,7 @@ def main() -> None:
 	results = []
 	for target in targets:
 		metrics, test_plot_df = _train_one_target(train_df, val_df, test_df, feature_cols, target)
-		plot_path = _plot_test_global_distribution(test_plot_df, target, PLOT_DIR)
+		plot_path = _plot_test_global_distribution(test_plot_df, target, PLOT_DIR, SEASON, q_low, q_high)
 		print(f'Saved test global plot ({target}): {plot_path}')
 		results.append(metrics)
 	result_df = pd.DataFrame(results)
