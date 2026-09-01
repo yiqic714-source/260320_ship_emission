@@ -15,6 +15,10 @@ YEAR_START = 2000
 YEAR_END = 2022
 LSMASK_PATH = '/data/chenyiqi/251007_tropic/landsea.nc'
 
+# ====================== 【新增开关】 ======================
+SAVE_NPZ = False                 # 是否保存 processed npz → True/False
+# ==========================================================
+
 # Set to 'log' for logarithmic color scaling, or 'linear' for linear color scaling.
 COLOR_SCALE_MODE = 'log'
 
@@ -142,7 +146,11 @@ def _aggregate_to_1deg_grid(annual_mean_01deg: np.ndarray, lat: np.ndarray, lon:
     return grid
 
 
-def load_annual_mean_1deg(year: int) -> np.ndarray:
+def load_monthly_1deg(year: int) -> np.ndarray:
+    """Load monthly 0.1deg data from NetCDF and aggregate each month to 1deg.
+
+    Returns an array shape (12, nlat_1deg, nlon_1deg).
+    """
     nc_path = os.path.join(NC_DIR, NC_FILENAME_TEMPLATE.format(year=year))
     if not os.path.exists(nc_path):
         raise FileNotFoundError(f'NetCDF file not found: {nc_path}')
@@ -151,32 +159,46 @@ def load_annual_mean_1deg(year: int) -> np.ndarray:
         if SUM_VAR not in ds.variables:
             raise KeyError(f"Variable '{SUM_VAR}' not found in {nc_path}")
 
-        annual_data = ds.variables[SUM_VAR][:].astype(np.float64)
-        if annual_data.ndim != 3 or annual_data.shape[0] != 12:
-            raise ValueError(f'Expected 12 monthly time steps in {nc_path}, got shape {annual_data.shape}')
+        monthly_data = ds.variables[SUM_VAR][:].astype(np.float64)
+        if monthly_data.ndim != 3 or monthly_data.shape[0] != 12:
+            raise ValueError(f'Expected 12 monthly time steps in {nc_path}, got shape {monthly_data.shape}')
 
         lat = ds.variables['lat'][:].astype(np.float64)
         lon = ds.variables['lon'][:].astype(np.float64)
 
-    annual_mean = np.nanmean(annual_data, axis=0)
-    return _aggregate_to_1deg_grid(annual_mean, lat, lon)
+    monthly_grids = []
+    for m in range(monthly_data.shape[0]):
+        monthly_grids.append(_aggregate_to_1deg_grid(monthly_data[m], lat, lon))
+    return np.stack(monthly_grids, axis=0)
 
 
-def _build_output_path(year: int) -> str:
-    return os.path.join(OUT_DIR, 'figs', f'sox_annual_mean_{year}.png')
+def _build_shared_norm(all_grids: list[np.ndarray]):
+    mode = COLOR_SCALE_MODE.lower().strip()
+    if mode not in {'log', 'linear'}:
+        raise ValueError("COLOR_SCALE_MODE must be either 'log' or 'linear'.")
+
+    if SHARED_VMIN is not None and SHARED_VMAX is not None:
+        vmin = SHARED_VMIN
+        vmax = SHARED_VMAX
+    else:
+        values = np.concatenate([grid[np.isfinite(grid)] for grid in all_grids])
+        if mode == 'log':
+            values = values[values > 0.0]
+        if values.size == 0:
+            raise ValueError('No finite positive values are available for color scaling.')
+        vmin = float(np.nanmin(values))
+        vmax = float(np.nanmax(values))
+
+    if mode == 'log':
+        return LogNorm(vmin=vmin, vmax=vmax)
+    return Normalize(vmin=vmin, vmax=vmax)
 
 
-def plot_annual_mean(year: int, sox_grid: np.ndarray, norm):
-    out_path = _build_output_path(year)
-    os.makedirs(os.path.join(OUT_DIR, 'figs'), exist_ok=True)
-    os.makedirs(os.path.join(OUT_DIR, 'processed_data'), exist_ok=True)
-
-    plot_grid = sox_grid.copy()
+def plot_year_mean(year: int, monthly_grids: np.ndarray, norm) -> None:
+    out_path = os.path.join(OUT_DIR, 'figs', f'sox_monthly_mean_{year}.png')
+    plot_grid = np.nanmean(monthly_grids, axis=0)
     if COLOR_SCALE_MODE.lower().strip() == 'log':
         plot_grid = np.where(plot_grid > 0.0, plot_grid, np.nan)
-
-    global_mean = np.nanmean(plot_grid)
-    annotation = f'Global mean = {global_mean:.3e} Tg/1° grid'
 
     fig = plt.figure(figsize=(12, 6), dpi=300)
     ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
@@ -196,61 +218,105 @@ def plot_annual_mean(year: int, sox_grid: np.ndarray, norm):
     gl.right_labels = False
     ax.set_xlim(-180, 180)
     ax.set_ylim(-90, 90)
-    ax.set_title(f'SOx Annual Mean {year}')
+    ax.set_title(f'SOx Monthly Mean {year}')
     ax.set_xlabel('Longitude')
     ax.set_ylabel('Latitude')
-    ax.text(0.02, 0.02, annotation, transform=ax.transAxes, fontsize=8, color='black',
-            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
 
     cbar = fig.colorbar(hb, ax=ax, extend='both', pad=0.02)
-    cbar.set_label('Tg per 1°×1° grid (annual mean)')
+    cbar.set_label('SOx per 1deg x 1deg grid')
     cbar.ax.tick_params(labelsize=8)
-
     fig.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
     print(f'Saved figure: {out_path}')
 
 
-def main():
+# ====================== 【新增：全球平均年均 SO2 年际变化曲线】 ======================
+def plot_global_annual_mean_timeseries(years, annual_mean_values):
+    out_path = os.path.join(OUT_DIR, 'figs', 'global_annual_mean_so2_timeseries.png')
+    plt.figure(figsize=(8, 5), dpi=300)
+    
+    # 画主线
+    plt.plot(years, annual_mean_values, 'o-', color='#2E86AB', linewidth=2.5, markersize=6)
+    
+    # ---------------- 竖线：2005 和 2019 ----------------
+    plt.axvline(x=2005, color='red', linestyle='--', linewidth=1.5, alpha=0.8, label='2005')
+    plt.axvline(x=2019, color='blue', linestyle='--', linewidth=1.5, alpha=0.8, label='2019')
+    
+    # 网格
+    plt.grid(True, alpha=0.3, linestyle='--')
+    
+    # 字体全部加大
+    plt.xlabel('Year', fontsize=15, fontweight='normal')  # 变大
+    plt.ylabel('Global Ocean SO₂ Emission', fontsize=15)
+    
+    # 坐标轴刻度字体
+    plt.xticks(fontsize=13)
+    plt.yticks(fontsize=13)
+    
+    plt.tight_layout()
+    plt.savefig(out_path, bbox_inches='tight')
+    plt.close()
+    print(f'Saved time series: {out_path}')
+# ====================================================================================
+
+
+def main() -> None:
     os.makedirs(os.path.join(OUT_DIR, 'figs'), exist_ok=True)
     os.makedirs(os.path.join(OUT_DIR, 'processed_data'), exist_ok=True)
 
-    annual_grids = []
-    years = list(range(YEAR_START, YEAR_END + 1))
-    for year in years:
-        print(f'Loading year {year}...')
-        grid = load_annual_mean_1deg(year)
-        ocean_mask = _get_ocean_mask_1deg()
-        grid = np.where(ocean_mask, grid, np.nan)
-        grid = _fill_missing_ocean_sox_in_trop_midlat(grid, ocean_mask)
-        annual_grids.append(grid.astype(np.float32))
-        print(f'Year {year}: finite cells = {np.count_nonzero(np.isfinite(grid))}')
+    years = np.arange(YEAR_START, YEAR_END + 1, dtype=np.int16)
+    months = np.arange(1, 13, dtype=np.int16)
+    ocean_mask = _get_ocean_mask_1deg()
+    all_year_month_grids = []
 
-    all_values = np.concatenate([g[np.isfinite(g)] for g in annual_grids])
-    if all_values.size == 0:
-        raise ValueError('No finite values found in annual mean grids.')
+    # 存储每年全球平均
+    annual_global_means = []
 
-    mode = COLOR_SCALE_MODE.lower().strip()
-    if mode not in {'log', 'linear'}:
-        raise ValueError("COLOR_SCALE_MODE must be either 'log' or 'linear'.")
-    if mode == 'log':
-        norm = LogNorm(vmin=SHARED_VMIN, vmax=SHARED_VMAX)
+    for year in years.astype(int):
+        print(f'Loading monthly SOx for {year}...')
+        monthly_grids = load_monthly_1deg(year)
+        monthly_grids = np.where(ocean_mask[None, :, :], monthly_grids, np.nan)
+        monthly_grids = np.stack(
+            [_fill_missing_ocean_sox_in_trop_midlat(grid, ocean_mask) for grid in monthly_grids],
+            axis=0,
+        )
+        all_year_month_grids.append(monthly_grids.astype(np.float32))
+        print(f'{year}: finite cells per month = {[int(np.count_nonzero(np.isfinite(g))) for g in monthly_grids]}')
+
+        # 计算年均 → 全球平均
+        annual_mean = np.nanmean(monthly_grids, axis=0)
+        global_mean = np.nanmean(annual_mean)
+        annual_global_means.append(global_mean)
+
+    norm = _build_shared_norm(all_year_month_grids)
+    for year, monthly_grids in zip(years.astype(int), all_year_month_grids):
+        plot_year_mean(year, monthly_grids, norm)
+
+    # 画年际变化曲线
+    plot_global_annual_mean_timeseries(years, annual_global_means)
+
+    # ====================== 【开关控制是否保存 npz】 ======================
+    if SAVE_NPZ:
+        monthly_sox_grids = np.stack(all_year_month_grids, axis=0)
+        out_npz = os.path.join(
+            OUT_DIR,
+            'processed_data',
+            f'sox_monthly_{YEAR_START}_{YEAR_END}.npz',
+        )
+        np.savez_compressed(
+            out_npz,
+            years=years,
+            months=months,
+            lat_edges=LAT_EDGES.astype(np.float32),
+            lon_edges=LON_EDGES.astype(np.float32),
+            ocean_mask=ocean_mask.astype(np.bool_),
+            monthly_sox_grids=monthly_sox_grids.astype(np.float32),
+        )
+        print(f'Saved data: {out_npz}')
+        print(f'monthly_sox_grids shape: {monthly_sox_grids.shape}')
     else:
-        norm = Normalize(vmin=SHARED_VMIN, vmax=SHARED_VMAX)
-
-    for year, grid in zip(years, annual_grids):
-        plot_annual_mean(year, grid, norm)
-
-    out_npz = os.path.join(OUT_DIR, 'processed_data', f'sox_annual_mean_{YEAR_START}_{YEAR_END}.npz')
-    np.savez_compressed(
-        out_npz,
-        years=np.array(years, dtype=np.int16),
-        lat_edges=LAT_EDGES.astype(np.float32),
-        lon_edges=LON_EDGES.astype(np.float32),
-        ocean_mask=_get_ocean_mask_1deg().astype(np.bool_),
-        annual_mean_grids=np.stack(annual_grids, axis=0),
-    )
-    print(f'Saved data: {out_npz}')
+        print("⏩ SAVE_NPZ = False，跳过保存 .npz")
+    # ====================================================================
 
 
 if __name__ == '__main__':
