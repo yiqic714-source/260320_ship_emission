@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 import numpy as np
 import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 import xarray as xr
 from util import (
     collect_spatial_residual_stats,

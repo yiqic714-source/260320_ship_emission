@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 import numpy as np
 import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 import xarray as xr
 from util import (
     collect_spatial_residual_stats,
@@ -31,7 +33,7 @@ VAL_YEARS = (2018, 2019)
 COUNTERFACTUAL_YEARS = (2020,)
 
 # 每个样本中，按 accu_sox 分位点选择连续 10% 数据作为 unknown 区域。
-ACCU_SOX_MASK_START_QUANTILE = 0.00
+ACCU_SOX_MASK_START_QUANTILE = 0.90
 ACCU_SOX_MASK_FRACTION = 0.10
 
 TARGET_COL = 'lnnd'
@@ -43,13 +45,14 @@ WEIGHT_DECAY = 1e-5
 KNOWN_LOSS_WEIGHT = 0.05
 NUM_WORKERS = 32
 
+endding = "best_known_weight005"
 # ------------------------------------------------------------
 # Model usage:
 # True  -> load an existing fine-tuned model and skip training.
 # False -> load the pretrained model and run fine-tuning.
 USE_SAVED_MODEL = False
 SAVED_MODEL_PATH = Path(
-    '/home/chenyiqi/260320_ship_emission/processed_data/unet_lnnd/best_unet_lnnd.pt'
+    '/home/chenyiqi/260320_ship_emission/processed_data/unet_lnnd/unet_lnnd_'+endding+'.pt'
 )
 
 
@@ -473,7 +476,7 @@ def main() -> None:
         significance_level=SIGNIFICANCE_LEVEL,
         validation_years=VAL_YEARS,
         counterfactual_years=COUNTERFACTUAL_YEARS,
-        output_tag='best',
+        output_tag=endding,
     )
 
     # ---------------------------------------------------------
@@ -640,7 +643,7 @@ def main() -> None:
         'num_epochs_if_retraining': NUM_EPOCHS,
     }
     save_json(
-        OUT_DIR / 'config.json',
+        OUT_DIR / 'config_'+endding+'.json',
         config,
     )
 
@@ -765,13 +768,13 @@ def main() -> None:
                 )
 
         save_json(
-            OUT_DIR / 'history.json',
+            OUT_DIR / 'history_'+endding+'.json',
             history,
         )
 
         print(
             f'Saved training history: '
-            f'{OUT_DIR / "history_best.json"}'
+            f'{OUT_DIR / "history_"+endding+".json"}'
         )
 
         # 训练结束以后重新加载 20 个 epoch 中验证集
@@ -877,7 +880,7 @@ def main() -> None:
 
     global_summary_path = (
         OUT_DIR
-        / 'global_counterfactual_summary_best.json'
+        / 'global_counterfactual_summary_'+endding+'.json'
     )
     save_global_summary(
         global_summary_path,
