@@ -30,7 +30,7 @@ VAL_YEARS = (2018, 2019)
 
 # 用这些年份计算 lnNd_observed - lnNd_counterfactual。
 # 当前设置为 2020；如果以后要分析 2020–2022，可改成 (2020, 2021, 2022)。
-COUNTERFACTUAL_YEARS = (2020,)
+COUNTERFACTUAL_YEARS = (2021,)
 
 # 每个样本中，按 accu_sox 分位点选择连续 10% 数据作为 unknown 区域。
 ACCU_SOX_MASK_START_QUANTILE = 0.90
@@ -42,7 +42,7 @@ BATCH_SIZE = 2
 NUM_EPOCHS = 3
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
-KNOWN_LOSS_WEIGHT = 0.05
+KNOWN_LOSS_WEIGHT = 0.0
 NUM_WORKERS = 32
 
 endding = "best_known_weight005"
