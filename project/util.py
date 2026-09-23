@@ -1,7 +1,10 @@
 from pathlib import Path
+import datetime as dt
 import json
+import os
 import matplotlib.pyplot as plt
 import numpy as np
+import re
 import torch
 from typing import Sequence
 import torch.nn as nn
@@ -16,20 +19,68 @@ try:
 except ImportError:
     HAS_CARTOPY = False
 
-MIN_GRID_SAMPLES = 10
-SIGNIFICANCE_LEVEL = 0.05
 MASK_DEFINITION = ""
 VALIDATION_YEARS: Sequence[int] = ()
 COUNTERFACTUAL_YEARS: Sequence[int] = ()
 OUTPUT_TAG = 'output'
 
-def configure_output(mask_definition: str, min_grid_samples: int, significance_level: float, validation_years: Sequence[int], counterfactual_years: Sequence[int], output_tag: str) -> None:
-    global MASK_DEFINITION, MIN_GRID_SAMPLES, SIGNIFICANCE_LEVEL, VALIDATION_YEARS, COUNTERFACTUAL_YEARS, OUTPUT_TAG
+
+def normalize_years(years: int | Sequence[int]) -> tuple[int, ...]:
+    """
+    年份参数归一化：单个年份和年份序列都接受。
+
+    Python 里 (2019) 只是 int，单元素元组必须写成 (2019,)；
+    这里两种写法都兼容，避免出现
+    `TypeError: argument of type 'int' is not iterable`。
+    """
+    if isinstance(years, str):
+        raise TypeError(
+            'years must be an int or a sequence of ints, '
+            f'got {years!r}'
+        )
+
+    if isinstance(years, (int, np.integer)):
+        return (int(years),)
+
+    return tuple(int(year) for year in years)
+
+
+def parse_date_from_path(path: Path) -> dt.date | None:
+    match = re.search(r'_(\d{8})\d{4}\.nc$', path.name)
+    if not match:
+        return None
+    return dt.datetime.strptime(match.group(1), '%Y%m%d').date()
+
+
+def collect_grid_files(
+    data_root: Path,
+    years: int | tuple[int, ...],
+) -> list[Path]:
+    """
+    收集指定年份的日网格文件（按文件名里的日期过滤）。
+
+    单个年份（如 2019）或年份序列（如 (2018, 2019)）都接受。
+    """
+    year_set = set(normalize_years(years))
+
+    paths = []
+    for path in sorted(data_root.glob('*/ml_grid_*.nc')):
+        date_value = parse_date_from_path(path)
+        if date_value is not None and date_value.year in year_set:
+            paths.append(path)
+    if not paths:
+        raise ValueError(
+            f'No daily grid files found in {data_root} '
+            f'for years={sorted(year_set)}'
+        )
+    return paths
+
+
+def configure_output(mask_definition: str, validation_years: Sequence[int], counterfactual_years: Sequence[int], output_tag: str) -> None:
+    global MASK_DEFINITION, VALIDATION_YEARS, COUNTERFACTUAL_YEARS, OUTPUT_TAG
     MASK_DEFINITION = mask_definition
-    MIN_GRID_SAMPLES = min_grid_samples
-    SIGNIFICANCE_LEVEL = significance_level
-    VALIDATION_YEARS = tuple(validation_years)
-    COUNTERFACTUAL_YEARS = tuple(counterfactual_years)
+    VALIDATION_YEARS = normalize_years(validation_years)
+    COUNTERFACTUAL_YEARS = normalize_years(counterfactual_years)
     OUTPUT_TAG = output_tag
 
 def save_json(output_path: Path, data: object) -> None:
@@ -37,6 +88,57 @@ def save_json(output_path: Path, data: object) -> None:
         json.dumps(data, indent=2),
         encoding='utf-8',
     )
+
+
+# ------------------------------------------------------------
+# Loss functions shared by pretrain_random_mask.py and
+# unet_finetune_pretrained.py. 两个脚本共用同一份实现，
+# 修改这里两边同时生效。
+# ------------------------------------------------------------
+SUPPORTED_LOSS_TYPES = ('mse', 'mae')
+
+
+def validate_loss_type(loss_type: str) -> str:
+    """
+    校验 LOSS_TYPE 取值，返回规范化后的小写名称。
+
+    'mse' -> 均方误差
+    'mae' -> 平均绝对误差
+    """
+    normalized = str(loss_type).strip().lower()
+    if normalized not in SUPPORTED_LOSS_TYPES:
+        raise ValueError(
+            'LOSS_TYPE must be one of '
+            f'{SUPPORTED_LOSS_TYPES}, got {loss_type!r}'
+        )
+    return normalized
+
+
+def masked_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    loss_type: str,
+) -> torch.Tensor:
+    """
+    带 mask 的逐格点损失，只在 mask == 1 的格点上取平均。
+
+    loss_type='mse' -> mean((pred - target) ** 2)
+    loss_type='mae' -> mean(|pred - target|)
+
+    mask 全为 0 时用 clamp 避免除零，返回 0。
+    """
+    normalized = validate_loss_type(loss_type)
+
+    denom = torch.clamp(mask.sum(), min=1.0)
+    residual = pred - target
+
+    if normalized == 'mse':
+        per_cell = residual ** 2
+    else:
+        per_cell = residual.abs()
+
+    return torch.sum(per_cell * mask) / denom
 
 
 def _empty_spatial_accumulator(
@@ -208,414 +310,6 @@ def summarize_spatial_accumulator(
     }
 
 
-def global_stats_from_accumulator(
-    acc: dict[str, np.ndarray],
-) -> dict[str, float]:
-    n = int(np.sum(acc['count']))
-    if n == 0:
-        return {
-            'count': 0,
-            'mean': np.nan,
-            'rmse': np.nan,
-            'mae': np.nan,
-            'std': np.nan,
-            'abs_std': np.nan,
-        }
-
-    total_sum = float(np.sum(acc['sum']))
-    total_sum_sq = float(np.sum(acc['sum_sq']))
-    total_abs_sum = float(np.sum(acc['abs_sum']))
-    total_abs_sum_sq = float(
-        np.sum(acc['abs_sum_sq'])
-    )
-
-    mean = total_sum / n
-    rmse = np.sqrt(total_sum_sq / n)
-    mae = total_abs_sum / n
-
-    if n > 1:
-        var = max(
-            (
-                total_sum_sq
-                - total_sum ** 2 / n
-            )
-            / (n - 1),
-            0.0,
-        )
-        abs_var = max(
-            (
-                total_abs_sum_sq
-                - total_abs_sum ** 2 / n
-            )
-            / (n - 1),
-            0.0,
-        )
-    else:
-        var = np.nan
-        abs_var = np.nan
-
-    return {
-        'count': n,
-        'mean': float(mean),
-        'rmse': float(rmse),
-        'mae': float(mae),
-        'std': float(np.sqrt(var)),
-        'abs_std': float(np.sqrt(abs_var)),
-    }
-
-
-def welch_compare_target_abs_vs_validation_abs(
-    val_stats: dict[str, np.ndarray],
-    target_stats: dict[str, np.ndarray],
-) -> dict[str, np.ndarray]:
-    """
-    逐格点检验：
-
-        H0: E(|target delta|) <= E(|validation error|)
-        H1: E(|target delta|) >  E(|validation error|)
-
-    其中：
-        validation error = lnNd_observed - lnNd_predicted
-        target delta      = lnNd_observed - lnNd_counterfactual
-
-    使用 Welch t test 的逐格点近似，允许两时期方差不同。
-    """
-    n_val = val_stats['count'].astype(np.float64)
-    n_target = target_stats['count'].astype(np.float64)
-
-    mean_val = val_stats['mae']
-    mean_target = target_stats['mae']
-
-    var_val = val_stats['abs_var']
-    var_target = target_stats['abs_var']
-
-    t_stat = np.full(
-        n_val.shape,
-        np.nan,
-        dtype=np.float64,
-    )
-    dof = np.full_like(t_stat, np.nan)
-    p_one_sided = np.full_like(t_stat, np.nan)
-
-    valid = (
-        (n_val >= MIN_GRID_SAMPLES)
-        & (n_target >= MIN_GRID_SAMPLES)
-        & np.isfinite(mean_val)
-        & np.isfinite(mean_target)
-        & np.isfinite(var_val)
-        & np.isfinite(var_target)
-    )
-
-    term_val = np.zeros_like(t_stat)
-    term_target = np.zeros_like(t_stat)
-
-    term_val[valid] = (
-        var_val[valid]
-        / n_val[valid]
-    )
-    term_target[valid] = (
-        var_target[valid]
-        / n_target[valid]
-    )
-
-    se2 = term_val + term_target
-    valid_se = valid & (se2 > 0.0)
-
-    t_stat[valid_se] = (
-        mean_target[valid_se]
-        - mean_val[valid_se]
-    ) / np.sqrt(se2[valid_se])
-
-    denom = np.zeros_like(t_stat)
-    denom[valid_se] = (
-        (term_val[valid_se] ** 2)
-        / (n_val[valid_se] - 1.0)
-        + (term_target[valid_se] ** 2)
-        / (n_target[valid_se] - 1.0)
-    )
-
-    valid_df = valid_se & (denom > 0.0)
-
-    dof[valid_df] = (
-        se2[valid_df] ** 2
-        / denom[valid_df]
-    )
-
-    p_one_sided[valid_df] = student_t.sf(
-        t_stat[valid_df],
-        dof[valid_df],
-    )
-
-    significant_larger = (
-        valid_df
-        & (mean_target > mean_val)
-        & (p_one_sided < SIGNIFICANCE_LEVEL)
-    )
-
-    return {
-        't_stat': t_stat,
-        'dof': dof,
-        'p_one_sided': p_one_sided,
-        'significant_larger': significant_larger,
-    }
-
-
-def welch_compare_signed_means(
-    val_stats: dict[str, np.ndarray],
-    target_stats: dict[str, np.ndarray],
-) -> dict[str, np.ndarray]:
-    """
-    额外给出 signed residual 的两侧 Welch 检验：
-
-        validation residual = observed - predicted
-        target delta        = observed - counterfactual
-
-    检验两者均值是否不同。
-    """
-    n_val = val_stats['count'].astype(np.float64)
-    n_target = target_stats['count'].astype(np.float64)
-
-    mean_val = val_stats['mean']
-    mean_target = target_stats['mean']
-
-    var_val = val_stats['var']
-    var_target = target_stats['var']
-
-    t_stat = np.full(
-        n_val.shape,
-        np.nan,
-        dtype=np.float64,
-    )
-    dof = np.full_like(t_stat, np.nan)
-    p_two_sided = np.full_like(t_stat, np.nan)
-
-    valid = (
-        (n_val >= MIN_GRID_SAMPLES)
-        & (n_target >= MIN_GRID_SAMPLES)
-        & np.isfinite(mean_val)
-        & np.isfinite(mean_target)
-        & np.isfinite(var_val)
-        & np.isfinite(var_target)
-    )
-
-    term_val = np.zeros_like(t_stat)
-    term_target = np.zeros_like(t_stat)
-
-    term_val[valid] = (
-        var_val[valid]
-        / n_val[valid]
-    )
-    term_target[valid] = (
-        var_target[valid]
-        / n_target[valid]
-    )
-
-    se2 = term_val + term_target
-    valid_se = valid & (se2 > 0.0)
-
-    t_stat[valid_se] = (
-        mean_target[valid_se]
-        - mean_val[valid_se]
-    ) / np.sqrt(se2[valid_se])
-
-    denom = np.zeros_like(t_stat)
-    denom[valid_se] = (
-        (term_val[valid_se] ** 2)
-        / (n_val[valid_se] - 1.0)
-        + (term_target[valid_se] ** 2)
-        / (n_target[valid_se] - 1.0)
-    )
-
-    valid_df = valid_se & (denom > 0.0)
-
-    dof[valid_df] = (
-        se2[valid_df] ** 2
-        / denom[valid_df]
-    )
-
-    p_two_sided[valid_df] = (
-        2.0
-        * student_t.sf(
-            np.abs(t_stat[valid_df]),
-            dof[valid_df],
-        )
-    )
-
-    return {
-        't_stat': t_stat,
-        'dof': dof,
-        'p_two_sided': p_two_sided,
-        'significant_difference': (
-            valid_df
-            & (
-                p_two_sided
-                < SIGNIFICANCE_LEVEL
-            )
-        ),
-    }
-
-
-def _safe_ratio(
-    numerator: np.ndarray,
-    denominator: np.ndarray,
-) -> np.ndarray:
-    out = np.full(
-        numerator.shape,
-        np.nan,
-        dtype=np.float64,
-    )
-    valid = (
-        np.isfinite(numerator)
-        & np.isfinite(denominator)
-        & (denominator > 0.0)
-    )
-    out[valid] = (
-        numerator[valid]
-        / denominator[valid]
-    )
-    return out
-
-
-def save_spatial_diagnostics(
-    output_path: Path,
-    lat: np.ndarray,
-    lon: np.ndarray,
-    val_stats: dict[str, np.ndarray],
-    target_stats: dict[str, np.ndarray],
-    abs_test: dict[str, np.ndarray],
-    signed_test: dict[str, np.ndarray],
-) -> None:
-    ratio_mae = _safe_ratio(
-        target_stats['mae'],
-        val_stats['mae'],
-    )
-    ratio_rmse = _safe_ratio(
-        np.abs(target_stats['mean']),
-        val_stats['rmse'],
-    )
-
-    corrected_signed_effect = (
-        target_stats['mean']
-        - val_stats['mean']
-    )
-
-    ds = xr.Dataset(
-        data_vars={
-            'val_count': (
-                ('lat', 'lon'),
-                val_stats['count'].astype(np.int32),
-            ),
-            'val_error_mean': (
-                ('lat', 'lon'),
-                val_stats['mean'].astype(np.float32),
-            ),
-            'val_error_mae': (
-                ('lat', 'lon'),
-                val_stats['mae'].astype(np.float32),
-            ),
-            'val_error_rmse': (
-                ('lat', 'lon'),
-                val_stats['rmse'].astype(np.float32),
-            ),
-            'val_error_std': (
-                ('lat', 'lon'),
-                val_stats['std'].astype(np.float32),
-            ),
-            'target_count': (
-                ('lat', 'lon'),
-                target_stats['count'].astype(np.int32),
-            ),
-            'delta_lnnd_mean': (
-                ('lat', 'lon'),
-                target_stats['mean'].astype(np.float32),
-            ),
-            'delta_lnnd_abs_mean': (
-                ('lat', 'lon'),
-                target_stats['mae'].astype(np.float32),
-            ),
-            'delta_lnnd_std': (
-                ('lat', 'lon'),
-                target_stats['std'].astype(np.float32),
-            ),
-            'target_abs_to_val_mae_ratio': (
-                ('lat', 'lon'),
-                ratio_mae.astype(np.float32),
-            ),
-            'abs_mean_delta_to_val_rmse_ratio': (
-                ('lat', 'lon'),
-                ratio_rmse.astype(np.float32),
-            ),
-            'bias_corrected_delta_lnnd': (
-                ('lat', 'lon'),
-                corrected_signed_effect.astype(np.float32),
-            ),
-            'abs_welch_t': (
-                ('lat', 'lon'),
-                abs_test['t_stat'].astype(np.float32),
-            ),
-            'abs_welch_p_one_sided': (
-                ('lat', 'lon'),
-                abs_test['p_one_sided'].astype(np.float32),
-            ),
-            'abs_target_significantly_larger': (
-                ('lat', 'lon'),
-                abs_test['significant_larger'].astype(np.int8),
-            ),
-            'signed_welch_t': (
-                ('lat', 'lon'),
-                signed_test['t_stat'].astype(np.float32),
-            ),
-            'signed_welch_p_two_sided': (
-                ('lat', 'lon'),
-                signed_test['p_two_sided'].astype(np.float32),
-            ),
-            'signed_target_diff_significant': (
-                ('lat', 'lon'),
-                signed_test[
-                    'significant_difference'
-                ].astype(np.int8),
-            ),
-        },
-        coords={
-            'lat': lat,
-            'lon': lon,
-        },
-        attrs={
-            'mask_definition': (
-                f'{MASK_DEFINITION}'
-                'of current-sample accu_sox among valid lnNd grid cells.'
-            ),
-            'validation_years': ','.join(
-                str(y) for y in VALIDATION_YEARS
-            ),
-            'counterfactual_years': ','.join(
-                str(y)
-                for y in COUNTERFACTUAL_YEARS
-            ),
-            'residual_definition': (
-                'observed_minus_reconstructed'
-            ),
-            'delta_definition': (
-                'lnNd_observed_minus_lnNd_counterfactual'
-            ),
-            'abs_test_definition': (
-                'One-sided Welch test of '
-                'mean(|target delta|) > '
-                'mean(|validation error|).'
-            ),
-            'signed_test_definition': (
-                'Two-sided Welch test of '
-                'mean(target signed delta) != '
-                'mean(validation signed residual).'
-            ),
-            'alpha': SIGNIFICANCE_LEVEL,
-            'min_grid_samples': MIN_GRID_SAMPLES,
-        },
-    )
-
-    ds.to_netcdf(output_path)
-
-
 def _percentile_abs(
     arr: np.ndarray,
     percentile: float = 98.0,
@@ -673,334 +367,311 @@ def area_weighted_mean(field: np.ndarray, lat: np.ndarray) -> float:
     return float(weighted_sum / np.sum(weights[valid]))
 
 
-def _plot_single_spatial_field(
-    output_path: Path,
-    lat: np.ndarray,
-    lon: np.ndarray,
-    field: np.ndarray,
-    title: str,
-    vmin: float,
-    vmax: float,
+def frequency_area_weighted_mean(field, lat, frequency=None):
+    area = np.broadcast_to(np.cos(np.deg2rad(lat)).reshape(-1, 1), field.shape)
+    freq = np.ones_like(field, dtype=float) if frequency is None else np.asarray(frequency, dtype=float)
+    valid = np.isfinite(field) & np.isfinite(freq) & (freq > 0)
+    if not np.any(valid):
+        return float("nan")
+    weights = area * freq
+    return float(np.sum(field[valid] * weights[valid]) / np.sum(weights[valid]))
+
+
+def plot_spatial_diagnostics(output_dir, lat, lon, val_stats, target_stats):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    val = val_stats["mean"].astype(float)
+    target = target_stats["mean"].astype(float)
+    difference = target - val
+    val_count = val_stats["count"].astype(float)
+    target_count = target_stats["count"].astype(float)
+    difference_count = np.minimum(val_count, target_count)
+    fields = [val, target, difference, target_count]
+    frequencies = [val_count, target_count, difference_count, None]
+    titles = ["Validation", "Counterfactual", "Counterfactual - Validation", "Counterfactual accu_sox-mask frequency"]
+    cmaps = ["RdBu_r", "RdBu_r", "RdBu_r", "viridis"]
+    labels = ["Delta lnNd", "Delta lnNd", "Delta lnNd", "Number of days"]
+    shared = _percentile_abs(np.concatenate([val[np.isfinite(val)], target[np.isfinite(target)]]), 98.0, 1.0)
+    vmaxes = [shared, shared, _percentile_abs(difference, 98.0, 1.0), max(float(np.nanmax(target_count)), 1.0)]
+    if HAS_CARTOPY:
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10), subplot_kw={"projection": ccrs.PlateCarree()}, constrained_layout=True)
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
+    for ax, field, frequency, title, cmap, label, vmax in zip(axes.flat, fields, frequencies, titles, cmaps, labels, vmaxes):
+        kwargs = {"shading": "auto", "cmap": cmap, "vmin": -vmax if cmap == "RdBu_r" else 0.0, "vmax": vmax}
+        if HAS_CARTOPY:
+            kwargs["transform"] = ccrs.PlateCarree()
+            ax.coastlines(resolution="110m", linewidth=0.7)
+        else:
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            ax.grid(linewidth=0.3, alpha=0.4)
+        mesh = ax.pcolormesh(lon, lat, field, **kwargs)
+        mean_value = frequency_area_weighted_mean(field, lat, frequency)
+        ax.set_title(f"{title}\nArea- and frequency-weighted mean: {mean_value:.4f}")
+        fig.colorbar(mesh, ax=ax, shrink=0.88, pad=0.03, label=label)
+    output_path = output_dir.joinpath(f"spatial_diagnostics_{OUTPUT_TAG}.png")
+    fig.savefig(output_path, dpi=250, bbox_inches="tight")
+    plt.close(fig)
+    return [output_path]
+
+
+# ------------------------------------------------------------
+# 数据层：pretrain_random_mask.py 和 unet_finetune_pretrained.py
+# 共用同一份实现，保证「输入变量顺序 / 标准化 / 掩膜口径 / 缓存格式」
+# 完全一致，两个脚本之间不会互相冲突。
+#
+# 缓存格式（每个日文件一个 .npy，形状 (n_feature + 2, H, W) float32）：
+#     [0:n_feature] = 原始 feature 通道（顺序 = feature_vars）
+#     [n_feature]   = 原始目标列（lnNd）
+#     [n_feature+1] = 原始 accu_sox（做 SOx 掩膜要用）
+# 存原始值，标准化在取数时按当前 feature_stats 现算，
+# 所以统计量变化（改训练子集/年份）不需要重建缓存；
+# 只有 feature_vars 改变才需要重建。
+# ------------------------------------------------------------
+def select_feature_vars(sample_path: Path) -> list[str]:
+    """
+    Fixed input variables for U-Net.
+
+    Only use selected meteorological and MODIS variables.
+    Latitude and longitude channels are not used.
+
+    两个脚本必须用同一份定义（通道顺序 = 输入通道顺序）。
+    """
+    selected_vars = [
+        'ssza_mod08',
+        'ssaa_mod08',
+        'slza_mod08',
+        'slaa_mod08',
+        'pv_1000',
+        'pv_750',
+        'pv_500',
+        'r_1000',
+        'r_750',
+        'r_500',
+        't_1000',
+        't_750',
+        't_500',
+        'u_1000',
+        'u_750',
+        'u_500',
+        'v_1000',
+        'v_750',
+        'v_500',
+        'u10',
+        'v10',
+        'd2m',
+        't2m',
+        'msl',
+        'sst',
+        'sp',
+        'blh',
+        'cape',
+        'tp',
+        'lsp',
+        'bld',
+        'ptype',
+    ]
+
+    with xr.open_dataset(sample_path) as ds:
+        missing = [
+            name for name in selected_vars
+            if name not in ds.data_vars
+        ]
+
+    if missing:
+        raise ValueError(
+            "Missing required feature variables: "
+            + ", ".join(missing)
+        )
+
+    return selected_vars
+
+
+def standardize(
+    arr: np.ndarray,
+    mean: float,
+    std: float,
+) -> np.ndarray:
+    out = (arr.astype(np.float32) - np.float32(mean)) / np.float32(std)
+    return np.nan_to_num(
+        out,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).astype(np.float32)
+
+
+def build_raw_stack(
+    path: Path,
+    feature_vars: list[str],
+    target_col: str = 'lnnd',
+    sox_var: str = 'accu_sox',
+) -> np.ndarray:
+    """
+    读一个日文件，返回 (n_feature + 2, H, W) 的 float32 原始值数组。
+    这就是缓存里存的东西，也是两个脚本共用的取数入口。
+    """
+    channels = []
+    with xr.open_dataset(path) as ds:
+        for name in feature_vars:
+            channels.append(ds[name].values.astype(np.float32))
+        channels.append(ds[target_col].values.astype(np.float32))
+        channels.append(ds[sox_var].values.astype(np.float32))
+
+    return np.stack(channels, axis=0).astype(np.float32)
+
+
+def build_mask_from_accu_sox(
+    current_accu_sox: np.ndarray,
+    target_valid: np.ndarray,
+    start_quantile: float,
+    fraction: float,
+) -> np.ndarray:
+    """
+    在 target 有效、且 accu_sox 有效的格点内，按 accu_sox 升序排序，
+    取分位点区间 [start_quantile, start_quantile + fraction] 的格点作为掩膜。
+
+    即「当前样本自身 accu_sox 最高的那一档格点」。例如：
+        start_quantile=0.90, fraction=0.10 -> 最高 10%
+        start_quantile=0.60, fraction=0.40 -> 最高 40%
+
+    start/end 用 floor / ceil 换算并做 clamp，保证至少取到 1 个格点。
+    两个脚本都用这个函数，避免出现两套掩膜定义。
+    """
+    sox = current_accu_sox.astype(np.float64)
+    candidate = np.isfinite(sox) & (target_valid > 0.5)
+
+    mask = np.zeros(sox.shape, dtype=np.float32)
+    flat_idx = np.flatnonzero(candidate.ravel())
+    n_valid = flat_idx.size
+    if n_valid == 0:
+        return mask
+
+    values = sox.ravel()[flat_idx]
+    sorted_local = np.argsort(values)
+
+    start = int(np.floor(start_quantile * n_valid))
+    end = int(np.ceil(
+        (start_quantile + fraction) * n_valid
+    ))
+    start = min(max(start, 0), n_valid - 1)
+    end = min(max(end, start + 1), n_valid)
+
+    selected_local = sorted_local[start:end]
+    mask.ravel()[flat_idx[selected_local]] = 1.0
+    return mask
+
+
+def cache_path_for(cache_dir: Path, path: Path) -> Path:
+    return cache_dir / f'{path.stem}.npy'
+
+
+def cache_meta_path(cache_dir: Path) -> Path:
+    return cache_dir / 'cache_meta.json'
+
+
+def save_cache_metadata(
+    cache_dir: Path,
+    feature_vars: list[str],
+    n_files: int,
+) -> None:
+    save_json(
+        cache_meta_path(cache_dir),
+        {
+            'feature_vars': list(feature_vars),
+            'n_cached_files': int(n_files),
+            'cache_layout': 'raw_features + raw_target + raw_accu_sox',
+        },
+    )
+
+
+def validate_cache_metadata(
+    cache_dir: Path,
+    feature_vars: list[str],
 ) -> None:
     """
-    绘制一张空间分布图。
-    所有 lnNd 差值图均使用以 0 为中心的 RdBu_r 色标。
+    缓存按 feature_vars 的顺序排列通道，变量列表一变旧缓存就不能用；
+    这里直接报错要求重建，避免静默用错通道顺序。
     """
-    if HAS_CARTOPY:
-        fig, ax = plt.subplots(
-            1,
-            1,
-            figsize=(8.5, 5.5),
-            subplot_kw={
-                'projection': ccrs.PlateCarree()
-            },
-            constrained_layout=True,
-        )
-        transform = ccrs.PlateCarree()
-    else:
-        fig, ax = plt.subplots(
-            1,
-            1,
-            figsize=(8.5, 5.5),
-            constrained_layout=True,
-        )
-        transform = None
-
-    kwargs = {
-        'shading': 'auto',
-        'cmap': 'RdBu_r',
-        'vmin': vmin,
-        'vmax': vmax,
-    }
-    if transform is not None:
-        kwargs['transform'] = transform
-
-    mesh = ax.pcolormesh(
-        lon,
-        lat,
-        field,
-        **kwargs,
-    )
-
-    if HAS_CARTOPY:
-        ax.coastlines(
-            resolution='110m',
-            linewidth=0.7,
-        )
-        ax.add_feature(
-            cfeature.BORDERS,
-            linewidth=0.35,
-        )
-        gl = ax.gridlines(
-            draw_labels=True,
-            linewidth=0.3,
-            alpha=0.5,
-        )
-        gl.top_labels = False
-        gl.right_labels = False
-    else:
-        ax.set_xlabel('Longitude')
-        ax.set_ylabel('Latitude')
-        ax.grid(
-            linewidth=0.3,
-            alpha=0.4,
+    meta_path = cache_meta_path(cache_dir)
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f'Cache directory {cache_dir} has no cache_meta.json, '
+            'cannot verify that its contents match the current '
+            'feature_vars. Set REBUILD_CACHE=True '
+            'or delete the cache directory.'
         )
 
-    mean_value = area_weighted_mean(field, lat)
-    ax.set_title(
-        f"{title}\nArea-weighted mean: {mean_value:.4f}",
-        fontsize=13,
-    )
+    meta = json.loads(meta_path.read_text(encoding='utf-8'))
 
-    cbar = fig.colorbar(
-        mesh,
-        ax=ax,
-        shrink=0.90,
-        pad=0.03,
-    )
-    cbar.set_label(
-        r'$\Delta \ln N_d$'
-    )
-
-    fig.savefig(
-        output_path,
-        dpi=250,
-        bbox_inches='tight',
-    )
-    plt.close(fig)
+    if list(meta.get('feature_vars', [])) != list(feature_vars):
+        raise ValueError(
+            'Cached feature_vars differ from the current ones. '
+            'Set REBUILD_CACHE=True or delete the cache directory.'
+        )
 
 
-def plot_spatial_diagnostics(
-    output_dir: Path,
-    lat: np.ndarray,
-    lon: np.ndarray,
-    val_stats: dict[str, np.ndarray],
-    target_stats: dict[str, np.ndarray],
-) -> list[Path]:
+def prepare_preprocessed_cache(
+    paths: list[Path],
+    feature_vars: list[str],
+    cache_dir: Path,
+    rebuild: bool = False,
+) -> None:
     """
-    输出三张独立空间图：
+    把所有需要用到的日文件预处理成 .npy 缓存（缺哪个补哪个）。
 
-    1. VALIDATION_YEARS:
-       mean(lnNd_obs - lnNd_predict)
-
-    2. 2020:
-       mean(lnNd_obs - lnNd_predict)
-       这里的 predict 即 U-Net counterfactual reconstruction。
-
-    3. 2020 - VAL:
-       [2020 mean(lnNd_obs - lnNd_predict)]
-       -
-       [VAL mean(lnNd_obs - lnNd_predict)]
-
-       该量等价于扣除验证期平均系统残差后的 2020 差值。
+    两个脚本共用同一个 cache_dir，所以谁先跑谁建，另一个直接复用。
     """
-    output_dir.mkdir(
+    cache_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    val_residual = (
-        val_stats['mean']
-        .astype(np.float64)
-    )
-    target_residual = (
-        target_stats['mean']
-        .astype(np.float64)
-    )
+    if rebuild:
+        missing = list(paths)
+    else:
+        if cache_meta_path(cache_dir).exists():
+            validate_cache_metadata(cache_dir, feature_vars)
+        missing = [
+            path
+            for path in paths
+            if not cache_path_for(cache_dir, path).exists()
+        ]
 
-    target_minus_val = (
-        target_residual
-        - val_residual
-    )
-
-    # 第一、第二张图使用完全相同的色标范围，
-    # 便于直接比较 VAL 与 2020 的残差幅度和符号。
-    shared_vmax = _percentile_abs(
-        np.concatenate([
-            val_residual[np.isfinite(val_residual)],
-            target_residual[np.isfinite(target_residual)],
-        ]),
-        percentile=98.0,
-        fallback=1.0,
+    n_channels = len(feature_vars) + 2
+    print(f'Preprocessed cache: {cache_dir}')
+    print(
+        f'  files: {len(paths) - len(missing)}/{len(paths)} cached, '
+        f'{len(missing)} to build | '
+        f'{n_channels}x180x360 float32 = '
+        f'{n_channels * 180 * 360 * 4 / 1e6:.1f} MB/file, '
+        f'total {len(paths) * n_channels * 180 * 360 * 4 / 1e9:.1f} GB'
     )
 
-    # 第三张图单独使用对称色标。
-    difference_vmax = _percentile_abs(
-        target_minus_val,
-        percentile=98.0,
-        fallback=1.0,
-    )
-
-    val_year_text = (
-        '-'.join(
-            str(y)
-            for y in VALIDATION_YEARS
-        )
-    )
-
-    target_year_text = (
-        ', '.join(
-            str(y)
-            for y in COUNTERFACTUAL_YEARS
-        )
-    )
-
-    path_val = (
-        output_dir
-        / f'01_VALID_lnNd_obs_minus_predict_{OUTPUT_TAG}.png'
-    )
-    path_target = (
-        output_dir
-        / f'02_2020_lnNd_obs_minus_predict_{OUTPUT_TAG}.png'
-    )
-    path_difference = (
-        output_dir
-        / f'03_2020_minus_VALID_residual_{OUTPUT_TAG}.png'
-    )
-
-    _plot_single_spatial_field(
-        output_path=path_val,
-        lat=lat,
-        lon=lon,
-        field=val_residual,
-        title=(
-            f'Validation ({val_year_text}): '
-            r'$\ln N_d^{obs}-\ln N_d^{predict}$'
-        ),
-        vmin=-shared_vmax,
-        vmax=shared_vmax,
-    )
-
-    _plot_single_spatial_field(
-        output_path=path_target,
-        lat=lat,
-        lon=lon,
-        field=target_residual,
-        title=(
-            f'{target_year_text}: '
-            r'$\ln N_d^{obs}-\ln N_d^{predict}$'
-        ),
-        vmin=-shared_vmax,
-        vmax=shared_vmax,
-    )
-
-    _plot_single_spatial_field(
-        output_path=path_difference,
-        lat=lat,
-        lon=lon,
-        field=target_minus_val,
-        title=(
-            f'{target_year_text} residual '
-            f'- validation ({val_year_text}) residual'
-        ),
-        vmin=-difference_vmax,
-        vmax=difference_vmax,
-    )
-
-    return [
-        path_val,
-        path_target,
-        path_difference,
-    ]
-
-
-def save_global_summary(
-    output_path: Path,
-    val_acc: dict[str, np.ndarray],
-    target_acc: dict[str, np.ndarray],
-) -> None:
-    val_global = global_stats_from_accumulator(
-        val_acc
-    )
-    target_global = global_stats_from_accumulator(
-        target_acc
-    )
-
-    # 全部 high-SOx 像元 pooled 后，对 |target delta|
-    # 是否大于 |validation error| 做 Welch 检验。
-    n_val = val_global['count']
-    n_target = target_global['count']
-
-    global_result = {
-        'validation': val_global,
-        'counterfactual_period': target_global,
-    }
-
-    if (
-        n_val > 1
-        and n_target > 1
-        and np.isfinite(val_global['abs_std'])
-        and np.isfinite(
-            target_global['abs_std']
-        )
-    ):
-        val_abs_var = (
-            val_global['abs_std'] ** 2
-        )
-        target_abs_var = (
-            target_global['abs_std'] ** 2
-        )
-
-        term_val = val_abs_var / n_val
-        term_target = (
-            target_abs_var / n_target
-        )
-        se2 = term_val + term_target
-
-        if se2 > 0.0:
-            t_stat = (
-                target_global['mae']
-                - val_global['mae']
-            ) / np.sqrt(se2)
-
-            denom = (
-                term_val ** 2 / (n_val - 1)
-                + term_target ** 2
-                / (n_target - 1)
+    if missing:
+        print(f'  building cache for {len(missing)} files...')
+        total = len(missing)
+        for index, path in enumerate(missing, start=1):
+            target = cache_path_for(cache_dir, path)
+            stack = build_raw_stack(
+                path,
+                feature_vars,
             )
+            # 先写临时文件再原子替换，避免中断时留下半截文件被当成有效缓存。
+            tmp_path = target.with_suffix('.tmp.npy')
+            np.save(tmp_path, stack)
+            os.replace(tmp_path, target)
 
-            if denom > 0.0:
-                dof = se2 ** 2 / denom
-                p = float(
-                    student_t.sf(
-                        t_stat,
-                        dof,
-                    )
+            if index % 200 == 0 or index == total:
+                print(
+                    f'    cached {index}/{total} files',
+                    flush=True,
                 )
-            else:
-                dof = np.nan
-                p = np.nan
-        else:
-            t_stat = np.nan
-            dof = np.nan
-            p = np.nan
 
-        global_result[
-            'abs_target_vs_validation_test'
-        ] = {
-            'definition': (
-                'One-sided Welch test: '
-                'mean(|target delta|) > '
-                'mean(|validation error|)'
-            ),
-            't_stat': float(t_stat),
-            'dof': float(dof),
-            'p_one_sided': float(p),
-            'significant_at_alpha': bool(
-                np.isfinite(p)
-                and p < SIGNIFICANCE_LEVEL
-                and target_global['mae']
-                > val_global['mae']
-            ),
-            'alpha': SIGNIFICANCE_LEVEL,
-            'target_abs_to_validation_mae_ratio': float(
-                target_global['mae']
-                / val_global['mae']
-            )
-            if val_global['mae'] > 0
-            else np.nan,
-        }
-
-    save_json(output_path, global_result)
-
+    save_cache_metadata(
+        cache_dir,
+        feature_vars,
+        len(paths),
+    )
+    print('  preprocessed cache ready.')
 

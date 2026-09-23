@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import datetime as dt
-import re
 from pathlib import Path
 import numpy as np
 import torch
@@ -9,32 +7,45 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 import xarray as xr
 from util import (
+    build_mask_from_accu_sox,
+    build_raw_stack,
+    cache_path_for,
+    collect_grid_files,
     collect_spatial_residual_stats,
     configure_output,
-    global_stats_from_accumulator,
+    masked_loss,
     plot_spatial_diagnostics,
-    save_global_summary,
+    prepare_preprocessed_cache,
     save_json,
-    save_spatial_diagnostics,
+    standardize,
     summarize_spatial_accumulator,
-    welch_compare_signed_means,
-    welch_compare_target_abs_vs_validation_abs,
+    validate_loss_type,
 )
 
 
 DATA_ROOT = Path('/home/chenyiqi/260320_ship_emission/processed_data/ml_grid_data')
-OUT_DIR = Path('/home/chenyiqi/260320_ship_emission/processed_data/unet_lnnd')
+OUT_DIR = Path('/home/chenyiqi/260320_ship_emission/project/saved_model/tuned')
 
-TRAIN_YEARS = tuple(range(2000, 2018))
-VAL_YEARS = (2018, 2019)
+# 年份设置与 pretrain_random_mask.py 保持一致（同一种定义方式、同一套年份），
+# 这样预训练和微调的验证年/对比年相同，结果可以直接比较。
+# VAL_YEARS 同时从训练年份里排除，避免训练/验证重叠。
+VAL_YEARS = (2019,)
+
+TRAIN_YEARS = tuple(
+    year
+    for year in range(2005, 2020)
+    if year not in VAL_YEARS
+)
 
 # 用这些年份计算 lnNd_observed - lnNd_counterfactual。
-# 当前设置为 2020；如果以后要分析 2020–2022，可改成 (2020, 2021, 2022)。
-COUNTERFACTUAL_YEARS = (2021,)
+COUNTERFACTUAL_YEARS = (2022,)
 
-# 每个样本中，按 accu_sox 分位点选择连续 10% 数据作为 unknown 区域。
-ACCU_SOX_MASK_START_QUANTILE = 0.90
-ACCU_SOX_MASK_FRACTION = 0.10
+# 每个样本中，按 accu_sox 分位点取连续一段作为 unknown 区域。
+# 实现（util.build_mask_from_accu_sox）与 pretrain_random_mask.py 共用：
+#   pretrain: start_quantile=0.90, fraction=0.10 -> 最高 10%
+#   这里    : start_quantile=0.60, fraction=0.40 -> 最高 40%
+ACCU_SOX_MASK_START_QUANTILE = 0.60
+ACCU_SOX_MASK_FRACTION = 0.40
 
 TARGET_COL = 'lnnd'
 RANDOM_STATE = 42
@@ -42,31 +53,61 @@ BATCH_SIZE = 2
 NUM_EPOCHS = 3
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
-KNOWN_LOSS_WEIGHT = 0.0
-NUM_WORKERS = 32
+NUM_WORKERS = 16
 
-endding = "best_known_weight005"
+# ------------------------------------------------------------
+# 微调损失函数，可选（与 pretrain_random_mask.py 保持一致）：
+# 'mse' -> 均方误差 (pred - target) ** 2
+# 'mae' -> 平均绝对误差 |pred - target|
+# 只影响微调时反向传播使用的损失；evaluate() 会同时报告 RMSE 和 MAE，
+# 且 checkpoint 始终按 unknown_rmse 选择，方便不同损失之间比较。
+# 注意：这里和预训练脚本的 LOSS_TYPE 是各自独立的开关。
+# 具体实现（masked_loss / validate_loss_type）在 util.py 里，
+# 与 pretrain_random_mask.py 共用同一份代码。
+# ------------------------------------------------------------
+LOSS_TYPE = 'mse'
+
+# 与 pretrain_random_mask.py 保持一致：所有保存的文件名都带 OUTPUT_TAG，
+# 这样不同参数的实验不会互相覆盖。
+OUTPUT_TAG = 'sample_no19'
+
 # ------------------------------------------------------------
 # Model usage:
 # True  -> load an existing fine-tuned model and skip training.
 # False -> load the pretrained model and run fine-tuning.
 USE_SAVED_MODEL = False
-SAVED_MODEL_PATH = Path(
-    '/home/chenyiqi/260320_ship_emission/processed_data/unet_lnnd/unet_lnnd_'+endding+'.pt'
+SAVED_MODEL_PATH = (
+    OUT_DIR / f'tuned_unet_lnnd_{OUTPUT_TAG}.pt'
 )
 
+# 输入通道必须和预训练时一致：feature_vars + lnnd_known_fill（33 通道），
+# 否则 U-Net 的 in_channels 和预训练权重对不上。
+INPUT_MODE = 'feature+lnnd'
 
-INPUT_MODE = 'feature'
-PRETRAIN_MODEL_PATH = Path(
-    '/home/chenyiqi/260320_ship_emission/processed_data/unet_lnnd/pretrained_unet_lnnd.pt'
+# ------------------------------------------------------------
+# 预处理缓存：与 pretrain_random_mask.py 用**同一个目录**，
+# 谁先跑谁建、另一个直接复用，不用再处理数据。
+# 缓存里存的是原始值（feature + lnnd + accu_sox），标准化在取数时现算。
+# ------------------------------------------------------------
+USE_PREPROCESSED_CACHE = True
+CACHE_DIR = Path(
+    '/home/chenyiqi/260320_ship_emission/project/saved_model/cache_33var'
+)
+REBUILD_CACHE = False
+
+# 预训练 checkpoint：目录 + tag 必须与 pretrain_random_mask.py 的
+# OUT_DIR / OUTPUT_TAG 一致，否则会加载到旧模型或找不到文件。
+PRETRAIN_OUT_DIR = Path(
+    '/home/chenyiqi/260320_ship_emission/project/saved_model/pretrained'
+)
+PRETRAIN_OUTPUT_TAG = 'sample_100pct_no19_fill0'
+PRETRAIN_MODEL_PATH = (
+    PRETRAIN_OUT_DIR
+    / f'pretrained_unet_lnnd_{PRETRAIN_OUTPUT_TAG}.pt'
 )
 
 FINETUNE_LEARNING_RATE = 1e-5
 FINETUNE_EPOCHS = 4
-
-# 逐格点显著性比较至少需要的验证期/目标期样本数。
-MIN_GRID_SAMPLES = 10
-SIGNIFICANCE_LEVEL = 0.05
 
 # Same spirit as the old RF feature selection: keep meteorology and geometry,
 # but do not feed cloud target variables or SOx variables directly.
@@ -92,62 +133,6 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def parse_date_from_path(path: Path) -> dt.date | None:
-    match = re.search(r'_(\d{8})\d{4}\.nc$', path.name)
-    if not match:
-        return None
-    return dt.datetime.strptime(match.group(1), '%Y%m%d').date()
-
-
-def collect_grid_files(data_root: Path, years: tuple[int, ...]) -> list[Path]:
-    paths = []
-    for path in sorted(data_root.glob('*/ml_grid_*.nc')):
-        date_value = parse_date_from_path(path)
-        if date_value is not None and date_value.year in years:
-            paths.append(path)
-    if not paths:
-        raise ValueError(f'No daily grid files found in {data_root} for years={years}')
-    return paths
-
-
-def build_mask_from_accu_sox(
-    current_accu_sox: np.ndarray,
-    target_valid: np.ndarray,
-) -> np.ndarray:
-    """
-    从 ACCU_SOX_MASK_START_QUANTILE 开始选择 ACCU_SOX_MASK_FRACTION 数据作为 unknown 区域。
-
-    与旧代码不同：
-        旧：historical accu_sox - 2020 accu_sox 最大的 10%
-        新：当前样本 accu_sox 本身最大的 10%
-    """
-    sox = current_accu_sox.astype(np.float64)
-    candidate = np.isfinite(sox) & (target_valid > 0.5)
-
-    mask = np.zeros(sox.shape, dtype=np.float32)
-    flat_idx = np.flatnonzero(candidate.ravel())
-    n_valid = flat_idx.size
-    if n_valid == 0:
-        return mask
-    values = sox.ravel()[flat_idx]
-    sorted_local = np.argsort(values)
-
-    start = int(np.floor(ACCU_SOX_MASK_START_QUANTILE * n_valid))
-    end = int(np.ceil(
-        (ACCU_SOX_MASK_START_QUANTILE + ACCU_SOX_MASK_FRACTION)
-        * n_valid
-    ))
-    start = min(max(start, 0), n_valid - 1)
-    end = min(max(end, start + 1), n_valid)
-
-    selected_local = sorted_local[start:end]
-    top_flat_idx = flat_idx[selected_local]
-
-    mask.ravel()[top_flat_idx] = 1.0
-    return mask
-
-
-
 def get_grid_coordinates(sample_path: Path) -> tuple[np.ndarray, np.ndarray]:
     with xr.open_dataset(sample_path) as ds:
         lat = ds['lat'].values.astype(np.float64)
@@ -155,18 +140,13 @@ def get_grid_coordinates(sample_path: Path) -> tuple[np.ndarray, np.ndarray]:
     return lat, lon
 
 
-def standardize(arr: np.ndarray, mean: float, std: float) -> np.ndarray:
-    out = (arr.astype(np.float32) - np.float32(mean)) / np.float32(std)
-    return np.nan_to_num(
-        out,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    ).astype(np.float32)
-
-
-
 class LnndGridDataset(Dataset):
+    """
+    与 pretrain_random_mask.LnndGridDataset 保持同一套数据处理：
+    读缓存（或直接读 netCDF）→ 按 feature_stats 标准化 → 拼 lnnd 输入通道
+    → 生成 SOx 掩膜。唯一区别是这里不做随机挖洞（没有 AUGMENT_NUMBER）。
+    """
+
     def __init__(
         self,
         paths: list[Path],
@@ -177,38 +157,99 @@ class LnndGridDataset(Dataset):
         self.feature_vars = feature_vars
         self.feature_stats = feature_stats
 
+        # 逐通道 mean/std 预排成 (n_feature, 1, 1)，用于整块标准化。
+        self.feature_means = np.asarray(
+            [
+                feature_stats[name][0]
+                for name in feature_vars
+            ],
+            dtype=np.float32,
+        )[:, None, None]
+        self.feature_stds = np.asarray(
+            [
+                feature_stats[name][1]
+                for name in feature_vars
+            ],
+            dtype=np.float32,
+        )[:, None, None]
+
     def __len__(self) -> int:
         return len(self.paths)
 
+    def load_raw_stack(self, path: Path) -> np.ndarray:
+        """
+        取该文件的原始数据数组（优先读缓存，与 pretrain 共用同一份缓存）：
+            [0:n_feature] = 原始 feature 通道
+            [n_feature]   = 原始 lnNd
+            [n_feature+1] = 原始 accu_sox
+        """
+        if USE_PREPROCESSED_CACHE:
+            cached = cache_path_for(CACHE_DIR, path)
+            if cached.exists():
+                return np.load(cached)
+
+        return build_raw_stack(
+            path,
+            self.feature_vars,
+        )
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         path = self.paths[index]
+        stack = self.load_raw_stack(path)
 
-        with xr.open_dataset(path) as ds:
-            lnnd_true = ds[TARGET_COL].values.astype(np.float32)
-            current_accu_sox = ds['accu_sox'].values.astype(np.float32)
-            target_valid = np.isfinite(lnnd_true).astype(np.float32)
-            unknown_mask = build_mask_from_accu_sox(
-                current_accu_sox=current_accu_sox,
-                target_valid=target_valid,
-            )
-            unknown_mask = (unknown_mask * target_valid).astype(np.float32)
-            known_mask = (1.0 - unknown_mask) * target_valid
+        n_feature = len(self.feature_vars)
+        lnnd_true = stack[n_feature]
+        current_accu_sox = stack[n_feature + 1]
 
-            known_values = lnnd_true[known_mask > 0.5]
-            known_mean = (
-                float(np.nanmean(known_values))
-                if known_values.size
-                else float(np.nanmean(lnnd_true))
-            )
-            if not np.isfinite(known_mean):
-                known_mean = 0.0
+        # 与 pretrain 完全一致的逐通道标准化（整块算，nan/inf 统一填 0）。
+        features = np.nan_to_num(
+            (stack[:n_feature] - self.feature_means)
+            / self.feature_stds,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).astype(np.float32)
 
-            channels = []
-            for name in self.feature_vars:
-                mean, std = self.feature_stats[name]
-                channels.append(standardize(ds[name].values, mean, std))
+        target_valid = np.isfinite(lnnd_true).astype(np.float32)
 
-        x = np.stack(channels, axis=0).astype(np.float32)
+        # 微调用真实 SOx 掩膜（与 pretrain 非增强模式同一口径、同一实现）。
+        unknown_mask = build_mask_from_accu_sox(
+            current_accu_sox=current_accu_sox,
+            target_valid=target_valid,
+            start_quantile=ACCU_SOX_MASK_START_QUANTILE,
+            fraction=ACCU_SOX_MASK_FRACTION,
+        )
+        unknown_mask = (unknown_mask * target_valid).astype(np.float32)
+        known_mask = (1.0 - unknown_mask) * target_valid
+
+        # unknown 区域的 lnNd 不给模型看，用当前样本 known 区域均值占位。
+        known_values = lnnd_true[known_mask > 0.5]
+        if known_values.size:
+            known_mean = float(np.nanmean(known_values))
+        else:
+            known_mean = float(np.nanmean(lnnd_true))
+
+        if not np.isfinite(known_mean):
+            known_mean = 0.0
+
+        lnnd_known = lnnd_true.copy()
+        lnnd_known[unknown_mask > 0.5] = known_mean
+
+        # 输入通道与 pretrain 一致：feature_vars [+ 标准化后的 lnnd_known_fill]
+        if INPUT_MODE in ('lnnd', 'feature+lnnd'):
+            lnnd_mean, lnnd_std = self.feature_stats[TARGET_COL]
+            lnnd_channel = standardize(
+                lnnd_known,
+                lnnd_mean,
+                lnnd_std,
+            )[None, ...]
+            x = np.concatenate(
+                [features, lnnd_channel],
+                axis=0,
+            ).astype(np.float32)
+        else:
+            x = features
+
         y = np.nan_to_num(
             lnnd_true,
             nan=known_mean,
@@ -329,17 +370,6 @@ class UNet(nn.Module):
         return self.head(x)
 
 
-def masked_mse(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    denom = torch.clamp(mask.sum(), min=1.0)
-    return torch.sum(
-        ((pred - target) ** 2) * mask
-    ) / denom
-
-
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -353,24 +383,15 @@ def train_one_epoch(
         x = batch['x'].to(device)
         y = batch['y'].to(device)
         unknown_mask = batch['unknown_mask'].to(device)
-        known_mask = batch['known_mask'].to(device)
 
         pred = model(x)
 
-        loss_unknown = masked_mse(
+        # 只用 unknown 区域的损失（KNOWN_LOSS_WEIGHT 已移除，恒为 0）。
+        loss = masked_loss(
             pred,
             y,
             unknown_mask,
-        )
-        loss_known = masked_mse(
-            pred,
-            y,
-            known_mask,
-        )
-
-        loss = (
-            loss_unknown
-            + KNOWN_LOSS_WEIGHT * loss_known
+            LOSS_TYPE,
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -396,8 +417,10 @@ def evaluate(
 ) -> dict[str, float]:
     model.eval()
 
-    total_unknown_loss = 0.0
-    total_known_loss = 0.0
+    total_unknown_sq_error = 0.0
+    total_known_sq_error = 0.0
+    total_unknown_abs_error = 0.0
+    total_known_abs_error = 0.0
     total_unknown_count = 0.0
     total_known_count = 0.0
 
@@ -409,14 +432,26 @@ def evaluate(
 
         pred = model(x)
 
-        total_unknown_loss += float(
+        residual = pred - y
+
+        total_unknown_sq_error += float(
             torch.sum(
-                ((pred - y) ** 2) * unknown_mask
+                (residual ** 2) * unknown_mask
             ).cpu()
         )
-        total_known_loss += float(
+        total_known_sq_error += float(
             torch.sum(
-                ((pred - y) ** 2) * known_mask
+                (residual ** 2) * known_mask
+            ).cpu()
+        )
+        total_unknown_abs_error += float(
+            torch.sum(
+                residual.abs() * unknown_mask
+            ).cpu()
+        )
+        total_known_abs_error += float(
+            torch.sum(
+                residual.abs() * known_mask
             ).cpu()
         )
 
@@ -428,19 +463,31 @@ def evaluate(
         )
 
     unknown_mse = (
-        total_unknown_loss
+        total_unknown_sq_error
         / max(total_unknown_count, 1.0)
     )
     known_mse = (
-        total_known_loss
+        total_known_sq_error
+        / max(total_known_count, 1.0)
+    )
+    unknown_mae = (
+        total_unknown_abs_error
+        / max(total_unknown_count, 1.0)
+    )
+    known_mae = (
+        total_known_abs_error
         / max(total_known_count, 1.0)
     )
 
+    # 无论 LOSS_TYPE 是 'mse' 还是 'mae'，都同时返回 RMSE 和 MAE，
+    # 这样不同损失之间可以直接比较（checkpoint 仍按 unknown_rmse 选择）。
     return {
         'unknown_rmse': float(np.sqrt(unknown_mse)),
         'known_rmse': float(np.sqrt(known_mse)),
         'unknown_mse': float(unknown_mse),
         'known_mse': float(known_mse),
+        'unknown_mae': float(unknown_mae),
+        'known_mae': float(known_mae),
     }
 
 
@@ -450,6 +497,9 @@ def main() -> None:
         parents=True,
         exist_ok=True,
     )
+
+    # 提前校验损失函数名称，避免训练到一半才报错。
+    loss_type = validate_loss_type(LOSS_TYPE)
 
     train_paths = collect_grid_files(
         DATA_ROOT,
@@ -472,11 +522,9 @@ def main() -> None:
 
     configure_output(
         mask_definition=f"accu_sox quantile {ACCU_SOX_MASK_START_QUANTILE:.2f} to {ACCU_SOX_MASK_START_QUANTILE + ACCU_SOX_MASK_FRACTION:.2f}",
-        min_grid_samples=MIN_GRID_SAMPLES,
-        significance_level=SIGNIFICANCE_LEVEL,
         validation_years=VAL_YEARS,
         counterfactual_years=COUNTERFACTUAL_YEARS,
-        output_tag=endding,
+        output_tag=OUTPUT_TAG,
     )
 
     # ---------------------------------------------------------
@@ -557,9 +605,39 @@ def main() -> None:
             for name in feature_vars
         }
 
+        # lnnd 输入通道也要标准化，需要 lnnd 自己的统计量（与 pretrain 一致）。
+        if INPUT_MODE in ('lnnd', 'feature+lnnd'):
+            if TARGET_COL not in feature_stats_raw:
+                raise ValueError(
+                    f'The checkpoint has no stats for "{TARGET_COL}", '
+                    'but INPUT_MODE requires the lnnd input channel '
+                    'to be standardized. Retrain the pretrained model '
+                    'with the current pretrain_random_mask.py.'
+                )
+
+            feature_stats[TARGET_COL] = tuple(
+                float(v)
+                for v in feature_stats_raw[TARGET_COL]
+            )
+
     else:
         raise RuntimeError(
             'A model checkpoint is required; from-scratch training is disabled.'
+        )
+
+    # ---------------------------------------------------------
+    # 预处理缓存：与 pretrain 共用同一个 CACHE_DIR，
+    # 缺失的文件（例如只有微调用到的年份）在这里补齐。
+    # ---------------------------------------------------------
+    if USE_PREPROCESSED_CACHE:
+        cache_paths = list(dict.fromkeys(
+            train_paths + val_paths + target_paths
+        ))
+        prepare_preprocessed_cache(
+            cache_paths,
+            feature_vars,
+            CACHE_DIR,
+            REBUILD_CACHE,
         )
 
     # ---------------------------------------------------------
@@ -641,13 +719,15 @@ def main() -> None:
             else []
         ),
         'num_epochs_if_retraining': NUM_EPOCHS,
+        'loss_type': loss_type,
     }
     save_json(
-        OUT_DIR / 'config_'+endding+'.json',
+        OUT_DIR / f'config_{OUTPUT_TAG}.json',
         config,
     )
 
     print(f'Device: {device}')
+    print(f'Loss type: {loss_type}')
     print(
         f'Train files: {len(train_paths)}, '
         f'val files: {len(val_paths)}, '
@@ -708,11 +788,8 @@ def main() -> None:
         best_unknown_rmse = float('inf')
         history = []
 
-        # 新训练得到的最佳模型仍保存在原位置。
-        best_model_path = (
-            OUT_DIR
-            / 'best_unet_lnnd.pt'
-        )
+        # 新训练得到的最佳模型保存在 SAVED_MODEL_PATH（文件名带 OUTPUT_TAG）。
+        best_model_path = (SAVED_MODEL_PATH)
 
         for epoch in range(
             1,
@@ -743,7 +820,9 @@ def main() -> None:
                 f"val_unknown_rmse="
                 f"{metrics['unknown_rmse']:.6f} "
                 f"val_known_rmse="
-                f"{metrics['known_rmse']:.6f}"
+                f"{metrics['known_rmse']:.6f} "
+                f"val_unknown_mae="
+                f"{metrics['unknown_mae']:.6f}"
             )
 
             if (
@@ -768,13 +847,13 @@ def main() -> None:
                 )
 
         save_json(
-            OUT_DIR / 'history_'+endding+'.json',
+            OUT_DIR / f'history_{OUTPUT_TAG}.json',
             history,
         )
 
         print(
             f'Saved training history: '
-            f'{OUT_DIR / "history_"+endding+".json"}'
+            f'{OUT_DIR / f"history_{OUTPUT_TAG}.json"}'
         )
 
         # 训练结束以后重新加载 20 个 epoch 中验证集
@@ -790,7 +869,7 @@ def main() -> None:
         model.eval()
 
         print(
-            'Best epoch within the 20 epochs: '
+            'Best epoch: '
             f'{checkpoint["epoch"]}'
         )
         print(
@@ -835,39 +914,8 @@ def main() -> None:
         target_acc
     )
 
-    # ---------------------------------------------------------
-    # 3. 逐格点判断：
-    #    |target delta| 是否显著大于 validation absolute error
-    # ---------------------------------------------------------
-    abs_test = (
-        welch_compare_target_abs_vs_validation_abs(
-            val_stats,
-            target_stats,
-        )
-    )
-
-    # signed delta 与 validation signed bias 是否显著不同。
-    signed_test = welch_compare_signed_means(
-        val_stats,
-        target_stats,
-    )
-
     lat, lon = get_grid_coordinates(
         train_paths[-1]
-    )
-
-    diagnostic_nc = (
-        OUT_DIR
-        / 'spatial_counterfactual_diagnostics.nc'
-    )
-    save_spatial_diagnostics(
-        diagnostic_nc,
-        lat,
-        lon,
-        val_stats,
-        target_stats,
-        abs_test,
-        signed_test,
     )
 
     diagnostic_pngs = plot_spatial_diagnostics(
@@ -877,98 +925,9 @@ def main() -> None:
         val_stats,
         target_stats,
     )
-
-    global_summary_path = (
-        OUT_DIR
-        / 'global_counterfactual_summary_'+endding+'.json'
-    )
-    save_global_summary(
-        global_summary_path,
-        val_acc,
-        target_acc,
-    )
-
-    val_global = global_stats_from_accumulator(
-        val_acc
-    )
-    target_global = global_stats_from_accumulator(
-        target_acc
-    )
-
-    sig_fraction_den = np.sum(
-        (
-            val_stats['count']
-            >= MIN_GRID_SAMPLES
-        )
-        & (
-            target_stats['count']
-            >= MIN_GRID_SAMPLES
-        )
-        & np.isfinite(
-            abs_test['p_one_sided']
-        )
-    )
-    sig_fraction_num = np.sum(
-        abs_test['significant_larger']
-    )
-
-    sig_fraction = (
-        sig_fraction_num
-        / sig_fraction_den
-        if sig_fraction_den > 0
-        else np.nan
-    )
-
-    print('')
-    print('========== FINAL DIAGNOSTICS ==========')
-    print(
-        'Validation pooled MAE '
-        '(observed - predicted): '
-        f'{val_global["mae"]:.6f}'
-    )
-    print(
-        'Validation pooled RMSE '
-        '(observed - predicted): '
-        f'{val_global["rmse"]:.6f}'
-    )
-    print(
-        'Target pooled mean '
-        '(lnNd_observed - lnNd_counterfactual): '
-        f'{target_global["mean"]:.6f}'
-    )
-    print(
-        'Target pooled mean absolute difference: '
-        f'{target_global["mae"]:.6f}'
-    )
-
-    if val_global['mae'] > 0:
-        print(
-            'Target absolute difference / '
-            'validation MAE: '
-            f'{target_global["mae"] / val_global["mae"]:.3f}'
-        )
-
-    print(
-        'Fraction of tested grid cells where '
-        '|target delta| is significantly larger '
-        'than validation absolute error: '
-        f'{sig_fraction:.3%}'
-        if np.isfinite(sig_fraction)
-        else 'No grid cells have enough samples '
-        'for significance testing.'
-    )
-
-    print(
-        f'Saved spatial diagnostics: '
-        f'{diagnostic_nc}'
-    )
     print('Saved spatial figures:')
     for figure_path in diagnostic_pngs:
         print(f'  {figure_path}')
-    print(
-        f'Saved global summary: '
-        f'{global_summary_path}'
-    )
 
 
 if __name__ == '__main__':
